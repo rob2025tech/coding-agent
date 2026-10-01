@@ -223,6 +223,8 @@ Every tool must have:
 * side-effect classification
 * permission requirements
 
+The tool contracts in `docs/contracts.md` are authoritative for model-visible tools, permission checks, execution, and results.
+
 ---
 
 ### 4.6 ToolCall
@@ -458,6 +460,8 @@ ModelProvider interface
 The first real provider should be implemented only after the complete mock-based agent loop works.
 
 Provider routing, cost optimization, quota management, and local-model selection are future capabilities.
+
+The provider-neutral contracts in `docs/contracts.md` are authoritative for communication between the runtime and model providers; provider SDK types must not cross into the core runtime.
 
 ---
 

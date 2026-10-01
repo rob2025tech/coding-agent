@@ -36,11 +36,43 @@ class ErrorCode(StrEnum):
 
 
 class ProviderErrorCode(StrEnum):
+    """Normalized provider error codes — the exact §25 vocabulary."""
+
     AUTHENTICATION_FAILED = "AUTHENTICATION_FAILED"
-    RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
+    INVALID_REQUEST = "INVALID_REQUEST"
+    RATE_LIMITED = "RATE_LIMITED"
     CONTEXT_TOO_LARGE = "CONTEXT_TOO_LARGE"
-    INVALID_RESPONSE = "INVALID_RESPONSE"
-    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
+    NETWORK_ERROR = "NETWORK_ERROR"
+    PROVIDER_ERROR = "PROVIDER_ERROR"
+    CANCELLED = "CANCELLED"
+
+
+@dataclass(frozen=True)
+class ProviderError:
+    """Normalized provider error (docs/contracts.md §25).
+
+    Provider-neutral by construction — no SDK types. ``metadata`` may retain
+    provider-specific detail. v0.1 performs no retries; ``retryable`` and
+    ``retry_after_ms`` are advisory only.
+    """
+
+    code: ProviderErrorCode
+    message: str
+    retryable: bool = False
+    retry_after_ms: int | None = None
+    provider_id: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code.value,
+            "message": self.message,
+            "retryable": self.retryable,
+            "retry_after_ms": self.retry_after_ms,
+            "provider_id": self.provider_id,
+            "metadata": self.metadata,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -214,6 +246,43 @@ class ModelRequest:
     options: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "model": {"provider_id": self.model.provider_id, "model_id": self.model.model_id},
+            "system_instructions": self.system_instructions,
+            "messages": [
+                {
+                    "role": m.role.value,
+                    "content": [{"type": c.type.value, "text": c.text} for c in m.content],
+                    "message_id": m.message_id,
+                    "tool_calls": [
+                        {
+                            "tool_call_id": tc.tool_call_id,
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        }
+                        for tc in m.tool_calls
+                    ],
+                }
+                for m in self.messages
+            ],
+            "tools": [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                    "side_effect": t.side_effect.value,
+                    "permission": t.permission.value,
+                }
+                for t in self.tools
+            ],
+            "options": self.options,
+            "metadata": self.metadata,
+        }
+
 
 @dataclass(frozen=True)
 class ModelResponse:
@@ -226,6 +295,31 @@ class ModelResponse:
 
     def text(self) -> str:
         return "".join(block.text for block in self.content)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "response_id": self.response_id,
+            "stop_reason": self.stop_reason.value,
+            "content": [{"type": c.type.value, "text": c.text} for c in self.content],
+            "tool_calls": [
+                {
+                    "tool_call_id": tc.tool_call_id,
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                }
+                for tc in self.tool_calls
+            ],
+            "usage": (
+                {
+                    "input_tokens": self.usage.input_tokens,
+                    "output_tokens": self.usage.output_tokens,
+                    "cached_input_tokens": self.usage.cached_input_tokens,
+                }
+                if self.usage is not None
+                else None
+            ),
+            "metadata": self.metadata,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -337,12 +431,16 @@ class AgentTurn:
     ended_at: dt.datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        model_request = self.model_request.to_dict() if self.model_request else None
+        model_response = self.model_response.to_dict() if self.model_response else None
         return {
             "turn_id": self.turn_id,
             "session_id": self.session_id,
             "index": self.index,
             "started_at": self.started_at.isoformat(),
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
+            "model_request": model_request,
+            "model_response": model_response,
             "final_response": self.final_response,
             "tool_calls": [
                 {
@@ -406,6 +504,14 @@ class AgentSession:
                 "max_repeated_failures": self.limits.max_repeated_failures,
             },
             "history": [turn.to_dict() for turn in self.history],
+            "tool_call_history": [
+                {
+                    "tool_call_id": tc.tool_call_id,
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                }
+                for tc in self.tool_call_history
+            ],
             "verification_history": [
                 {
                     "passed": vr.passed,

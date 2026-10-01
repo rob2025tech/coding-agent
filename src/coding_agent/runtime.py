@@ -20,9 +20,11 @@ from coding_agent.context import ContextBuilder
 from coding_agent.contracts import (
     AgentSession,
     AgentTurn,
+    ProviderError,
     SessionState,
     ToolResultStatus,
 )
+from coding_agent.errors import normalize_provider_failure
 from coding_agent.events import AgentEvent, EventSink, EventType
 from coding_agent.executor import ToolExecutor
 from coding_agent.providers.base import ModelProvider
@@ -86,7 +88,19 @@ class AgentRuntime:
                 model_request=request,
             )
             self._emit(session, EventType.MODEL_REQUESTED, turn_id, request_id=request.request_id)
-            response = await self._provider.generate(request)
+            try:
+                response = await self._provider.generate(request)
+            except Exception as exc:  # provider failures must not escape as raw exceptions
+                provider_error = normalize_provider_failure(
+                    exc, provider_id=self._provider_id()
+                )
+                return self._terminate(
+                    session,
+                    SessionState.FAILED,
+                    f"provider error: {provider_error.code.value}: {provider_error.message}",
+                    turn_id=turn_id,
+                    provider_error=provider_error,
+                )
             turn.model_response = response
             turn_index += 1
             self._emit(
@@ -201,6 +215,7 @@ class AgentRuntime:
         reason: str,
         *,
         turn_id: str | None = None,
+        provider_error: ProviderError | None = None,
     ) -> AgentSession:
         session.state = state
         session.completed_status = reason
@@ -211,12 +226,22 @@ class AgentRuntime:
             event = EventType.SESSION_INTERRUPTED
         else:
             event = EventType.SESSION_FAILED
-        self._emit(session, event, turn_id, state=state.value, reason=reason)
+        payload: dict[str, Any] = {"state": state.value, "reason": reason}
+        if provider_error is not None:
+            payload["provider_error"] = provider_error.to_dict()
+        self._emit(session, event, turn_id, **payload)
         return session
 
     @staticmethod
     def _touch(session: AgentSession) -> None:
         session.updated_at = dt.datetime.now()
+
+    def _provider_id(self) -> str:
+        """Best-effort provider id for §25 normalization (never raises)."""
+        try:
+            return self._provider.describe().provider_id
+        except Exception:
+            return ""
 
     def _emit(
         self,

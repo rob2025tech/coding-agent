@@ -74,6 +74,7 @@ class ContextBuilder:
             )
         ]
 
+        verification_index = 0
         for turn in session.history:
             response = turn.model_response
             if response is not None:
@@ -99,16 +100,20 @@ class ContextBuilder:
                         content=[MessageContent.text_block(turn.final_response)],
                     )
                 )
-
-        # Verification results are appended last so a failed verification is the
-        # most recent context the model sees when it diagnoses (D11 failure path).
-        for verification in session.verification_history:
-            messages.append(
-                ModelMessage(
-                    role=MessageRole.TOOL,
-                    content=[MessageContent.text_block(_render_verification(verification))],
+            # Only a final-answer turn (no tool calls) triggers runtime verification,
+            # and the runtime appends that result to ``verification_history`` right
+            # after the turn. Render each verification immediately after the turn
+            # that produced it so the model sees the true causal chronology — and a
+            # failed verification stays visible to the very next turn (D11).
+            if not turn.tool_calls and verification_index < len(session.verification_history):
+                verification = session.verification_history[verification_index]
+                verification_index += 1
+                messages.append(
+                    ModelMessage(
+                        role=MessageRole.TOOL,
+                        content=[MessageContent.text_block(_render_verification(verification))],
+                    )
                 )
-            )
 
         return ModelRequest(
             request_id=f"req_{uuid.uuid4().hex[:8]}",

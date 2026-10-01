@@ -11,8 +11,13 @@ from coding_agent.contracts import (
     AgentTurn,
     ErrorCode,
     Limits,
+    MessageContent,
+    ModelRef,
+    ModelRequest,
+    ModelResponse,
     SessionState,
     StopReason,
+    ToolCall,
     ToolResult,
     ToolResultStatus,
 )
@@ -68,3 +73,84 @@ def test_session_and_turn_to_dict_are_json_serializable() -> None:
     assert session.to_dict()["state"] == "CREATED"
     assert session.to_dict()["history"][0]["turn_id"] == "t1"
     assert session.to_dict()["history"][0]["started_at"] == "2026-01-01T00:00:00"
+
+
+# --- corrections 3/4: to_dict includes model_request/model_response/tool_call_history --- #
+
+
+def _sample_request() -> ModelRequest:
+    return ModelRequest(
+        request_id="q1",
+        session_id="s1",
+        turn_id="t1",
+        model=ModelRef(provider_id="mock", model_id="mock-v1"),
+        system_instructions="sys",
+    )
+
+
+def _sample_response() -> ModelResponse:
+    return ModelResponse(
+        response_id="r1",
+        stop_reason=StopReason.COMPLETED,
+        content=[MessageContent.text_block("hi")],
+    )
+
+
+def test_turn_to_dict_includes_model_request_and_response() -> None:
+    turn = AgentTurn(
+        turn_id="t1",
+        session_id="s1",
+        index=0,
+        started_at=dt.datetime(2026, 1, 1),
+        model_request=_sample_request(),
+        model_response=_sample_response(),
+        final_response="hi",
+    )
+    d = turn.to_dict()
+    assert d["model_request"]["request_id"] == "q1"
+    assert d["model_request"]["model"] == {"provider_id": "mock", "model_id": "mock-v1"}
+    assert d["model_response"]["stop_reason"] == "completed"
+    assert d["model_response"]["content"] == [{"type": "text", "text": "hi"}]
+    json.dumps(d)  # must not raise
+
+
+def test_turn_to_dict_model_fields_present_when_unset() -> None:
+    turn = AgentTurn(turn_id="t", session_id="s", index=0, started_at=dt.datetime(2026, 1, 1))
+    d = turn.to_dict()
+    assert "model_request" in d
+    assert d["model_request"] is None
+    assert "model_response" in d
+    assert d["model_response"] is None
+
+
+def test_session_to_dict_includes_tool_call_history() -> None:
+    call = ToolCall(tool_call_id="c1", name="read_file", arguments={"path": "a"})
+    session = AgentSession(session_id="s1", request="do", repo_root="/r", working_dir="/r")
+    session.tool_call_history.append(call)
+    d = session.to_dict()
+    assert d["tool_call_history"] == [
+        {"tool_call_id": "c1", "name": "read_file", "arguments": {"path": "a"}}
+    ]
+    json.dumps(d)  # must not raise
+
+
+def test_fully_populated_session_to_dict_is_json_serializable() -> None:
+    call = ToolCall(tool_call_id="c1", name="edit_file", arguments={"path": "a"})
+    turn = AgentTurn(
+        turn_id="t1",
+        session_id="s1",
+        index=0,
+        started_at=dt.datetime(2026, 1, 1),
+        model_request=_sample_request(),
+        model_response=_sample_response(),
+        tool_calls=[call],
+        final_response="hi",
+        ended_at=dt.datetime(2026, 1, 1, 0, 1),
+    )
+    session = AgentSession(session_id="s1", request="do", repo_root="/r", working_dir="/r")
+    session.history.append(turn)
+    session.tool_call_history.append(call)
+    payload = json.dumps(session.to_dict())  # must not raise
+    assert "tool_call_history" in payload
+    assert "model_request" in payload
+    assert "model_response" in payload

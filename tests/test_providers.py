@@ -8,6 +8,7 @@ superseded request()/capabilities()/model_identity() sketch stays absent.
 from __future__ import annotations
 
 import inspect
+import json
 
 import pytest
 
@@ -17,8 +18,11 @@ from coding_agent.contracts import (
     ModelRef,
     ModelRequest,
     ModelResponse,
+    ProviderError,
+    ProviderErrorCode,
     StopReason,
 )
+from coding_agent.errors import ProviderExecutionError, normalize_provider_failure
 from coding_agent.providers.base import ModelProvider
 from coding_agent.providers.mock import (
     MockModelProvider,
@@ -156,3 +160,92 @@ async def test_provider_is_replaceable() -> None:
     assert isinstance(provider, ModelProvider)
     response = await provider.generate(_request())
     assert response.text() == "canned"
+
+
+# --- §25 provider error contract: exact normalized code vocabulary --- #
+
+
+def test_provider_error_code_vocabulary_is_exact() -> None:
+    assert {code.value for code in ProviderErrorCode} == {
+        "AUTHENTICATION_FAILED",
+        "INVALID_REQUEST",
+        "RATE_LIMITED",
+        "CONTEXT_TOO_LARGE",
+        "MODEL_UNAVAILABLE",
+        "NETWORK_ERROR",
+        "PROVIDER_ERROR",
+        "CANCELLED",
+    }
+
+
+def test_superseded_provider_error_values_absent() -> None:
+    values = {code.value for code in ProviderErrorCode}
+    for legacy in ("RATE_LIMIT_EXCEEDED", "INVALID_RESPONSE", "PROVIDER_UNAVAILABLE"):
+        assert legacy not in values
+
+
+# --- §25 normalized provider-error representation --- #
+
+
+def test_provider_error_representation_and_to_dict() -> None:
+    error = ProviderError(
+        code=ProviderErrorCode.RATE_LIMITED,
+        message="Provider rate limit reached.",
+        retryable=True,
+        retry_after_ms=5000,
+        provider_id="example-provider",
+        metadata={"scope": "chat"},
+    )
+    assert error.to_dict() == {
+        "code": "RATE_LIMITED",
+        "message": "Provider rate limit reached.",
+        "retryable": True,
+        "retry_after_ms": 5000,
+        "provider_id": "example-provider",
+        "metadata": {"scope": "chat"},
+    }
+    assert json.dumps(error.to_dict())  # JSON serializable
+
+
+def test_provider_error_defaults() -> None:
+    error = ProviderError(code=ProviderErrorCode.PROVIDER_ERROR, message="x")
+    assert error.retryable is False
+    assert error.retry_after_ms is None
+    assert error.provider_id == ""
+    assert error.metadata == {}
+
+
+# --- normalization at the provider boundary --- #
+
+
+def test_normalize_preserves_already_normalized_error() -> None:
+    original = ProviderError(
+        code=ProviderErrorCode.CONTEXT_TOO_LARGE,
+        message="too big",
+        provider_id="p",
+        metadata={"tokens": 999},
+    )
+    normalized = normalize_provider_failure(
+        ProviderExecutionError(original), provider_id="ignored"
+    )
+    assert normalized == original  # preserved verbatim when provider_id is present
+
+
+def test_normalize_fills_missing_provider_id() -> None:
+    original = ProviderError(code=ProviderErrorCode.NETWORK_ERROR, message="dns")
+    normalized = normalize_provider_failure(ProviderExecutionError(original), provider_id="acme")
+    assert normalized.code is ProviderErrorCode.NETWORK_ERROR
+    assert normalized.provider_id == "acme"
+
+
+def test_normalize_generic_exception_is_provider_error() -> None:
+    class VendorSDKError(Exception):
+        pass
+
+    normalized = normalize_provider_failure(VendorSDKError("kaboom"), provider_id="acme")
+    assert normalized.code is ProviderErrorCode.PROVIDER_ERROR
+    assert normalized.provider_id == "acme"
+    assert normalized.retryable is False
+    # The provider-specific *type name* is retained in metadata, never the class.
+    assert normalized.metadata["exception_type"] == "VendorSDKError"
+    assert "kaboom" in normalized.message

@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import json
+
 from coding_agent.context import ContextBuilder
 from coding_agent.contracts import (
     AgentSession,
     Limits,
+    ModelCapabilities,
+    ModelDescriptor,
     ModelRef,
+    ModelRequest,
+    ModelResponse,
+    ProviderError,
+    ProviderErrorCode,
     SessionState,
     ToolResultStatus,
 )
+from coding_agent.errors import ProviderExecutionError
 from coding_agent.events import EventType, ListEventSink
 from coding_agent.executor import ToolExecutor
 from coding_agent.permissions import Approver, AutoApprover, PermissionPolicy
+from coding_agent.providers.base import ModelProvider
 from coding_agent.providers.mock import (
     MockModelProvider,
     final_response,
@@ -30,7 +40,7 @@ from coding_agent.workspace import Workspace
 
 def _build(
     workspace: Workspace,
-    provider: MockModelProvider,
+    provider: ModelProvider,
     *,
     verify: str | None = None,
     verify_timeout: float = DEFAULT_VERIFY_TIMEOUT_S,
@@ -290,3 +300,85 @@ async def test_event_order_happy_path(workspace: Workspace, pycmd) -> None:
     # A write was approved and executed before completion.
     assert EventType.PERMISSION_GRANTED in types
     assert EventType.TOOL_COMPLETED in types
+
+
+# --- correction 2: provider failures are normalized at the runtime boundary --- #
+
+
+class _RaisingProvider(ModelProvider):
+    """A provider whose ``generate`` always raises the given exception."""
+
+    def __init__(self, exc: BaseException, provider_id: str = "raiser") -> None:
+        self._exc = exc
+        self._provider_id = provider_id
+
+    def describe(self) -> ModelDescriptor:
+        return ModelDescriptor(
+            provider_id=self._provider_id,
+            model_id="r1",
+            capabilities=ModelCapabilities(text=True, tool_calling=True),
+            context_window=1000,
+        )
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        raise self._exc
+
+
+async def test_provider_failure_does_not_escape_and_fails_session(
+    workspace: Workspace,
+) -> None:
+    provider = _RaisingProvider(RuntimeError("boom"))
+    runtime, session, sink, _t = _build(workspace, provider)
+    final = await runtime.run(session)  # must return, not raise
+    assert final.state is SessionState.FAILED
+    assert final.completed_status is not None
+    assert final.completed_status.startswith("provider error: PROVIDER_ERROR")
+    assert EventType.SESSION_FAILED in sink.types()
+
+
+async def test_provider_failure_event_carries_normalized_error(workspace: Workspace) -> None:
+    provider = _RaisingProvider(RuntimeError("boom"))
+    runtime, session, sink, _t = _build(workspace, provider)
+    await runtime.run(session)
+    failed = sink.of_type(EventType.SESSION_FAILED)
+    assert len(failed) == 1
+    payload = failed[0].payload
+    assert payload["provider_error"]["code"] == "PROVIDER_ERROR"
+    assert payload["provider_error"]["provider_id"] == "raiser"
+    assert payload["provider_error"]["metadata"]["exception_type"] == "RuntimeError"
+    json.dumps(payload)  # plain data only -> JSON serializable (no leaked class)
+
+
+async def test_normalized_provider_error_is_preserved(workspace: Workspace) -> None:
+    error = ProviderError(
+        code=ProviderErrorCode.RATE_LIMITED,
+        message="slow down",
+        retryable=True,
+        retry_after_ms=5000,
+        provider_id="raiser",
+    )
+    provider = _RaisingProvider(ProviderExecutionError(error))
+    runtime, session, sink, _t = _build(workspace, provider)
+    final = await runtime.run(session)
+    assert final.state is SessionState.FAILED
+    assert "RATE_LIMITED" in (final.completed_status or "")
+    payload = sink.of_type(EventType.SESSION_FAILED)[0].payload
+    assert payload["provider_error"]["code"] == "RATE_LIMITED"
+    assert payload["provider_error"]["retryable"] is True
+    assert payload["provider_error"]["retry_after_ms"] == 5000
+
+
+async def test_provider_specific_exception_type_does_not_leak(workspace: Workspace) -> None:
+    class VendorSDKError(Exception):
+        """Simulates a provider-specific exception class."""
+
+    provider = _RaisingProvider(VendorSDKError("secret vendor detail"))
+    runtime, session, sink, _t = _build(workspace, provider)
+    final = await runtime.run(session)
+    assert final.state is SessionState.FAILED
+    payload = sink.of_type(EventType.SESSION_FAILED)[0].payload
+    # Normalized to the generic code; only the type *name* (a str) is retained.
+    assert payload["provider_error"]["code"] == "PROVIDER_ERROR"
+    assert payload["provider_error"]["metadata"]["exception_type"] == "VendorSDKError"
+    assert isinstance(payload["provider_error"]["metadata"]["exception_type"], str)
+    assert "VendorSDKError" not in (final.completed_status or "")

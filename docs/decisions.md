@@ -80,7 +80,7 @@ execute with `shell=False`. ALLOW exact-argv only: `git status`, `git status
 `python`, and any test runner are ASK (unless they are the configured verify
 command run by the Verifier, D4). DENY (advisory, defense in depth): network tools
 (`curl`, `wget`, `ssh`, `scp`, `nc`), `sudo`, recursive force-delete, credential-file
-access (full list: see D16 and D20) — final, not overridable by `--yes` or the model. Everything else: ASK,
+access (full list: see D16) — final, not overridable by `--yes` or the model. Everything else: ASK,
 showing the full command.
 
 **Rationale.** A small exact-argv allowlist is auditable; DENY adds depth without
@@ -270,3 +270,34 @@ open question.
 **Rationale.** Catch residual contradictions after the amendment pass.
 
 **Consequences.** See the final report for each reviewed hit and the changes made.
+
+---
+
+## Review Resolutions (R1–R5)
+
+Resolutions from the post-D19 review of the open questions. Doc-only; no rule
+changes beyond the clarifications noted. The D12 definition of “write” is
+preserved unchanged.
+
+**R1 (refines D5).** In the architecture §4.8 example policy table, `git status`
+and `git diff` are annotated **exact argv only**, so the examples cannot be read
+as permitting arbitrary arguments. The authoritative allowlist remains the Shell
+policy subsection.
+
+**R2 (confirms D16).** `rm` rule unchanged: `rm` with both recursive and force
+flags is DENY; `rm -r` alone or `rm -f` alone is **not** DENY and falls through to
+ASK. Clarified inline in architecture §4.8.
+
+**R3 (confirms D14).** `--verify-timeout` units are **seconds**, default `120s`.
+Documented in architecture §4.10 and contracts §35 (now stating “in seconds”
+explicitly).
+
+**R4 (refines D15).** Verifier-output truncation is deterministic: retain up to
+**4,000 chars from the head** and **4,000 chars from the tail**, joined by
+`...[truncated]...`. The rendered string is not required to be exactly 8,000
+chars because the marker adds characters. Updated in contracts §35.
+
+**R5 (confirms D16).** The credential DENY list stays as explicitly enumerated
+for v0.1 (`.env`, `.ssh`, `.aws`, `.netrc`, `id_rsa`, `.git-credentials`) and is
+**not** expanded to `.pem`, `id_ed25519`, `.pgpass`, etc. It remains explicitly
+non-exhaustive. No change to architecture §4.8.

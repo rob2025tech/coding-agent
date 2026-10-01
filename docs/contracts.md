@@ -1096,7 +1096,7 @@ ran_at       datetime
 timed_out    bool
 ```
 
-`VERIFY_OUTPUT_MAX_CHARS = 8000`: when verifier output exceeds this, keep the head and tail and mark the elision (e.g. `\n...[truncated]...\n`). The verifier timeout defaults to **120s** (`--verify-timeout`).
+`VERIFY_OUTPUT_MAX_CHARS = 8000`: when verifier output exceeds this, retain up to **4,000 chars from the head** and **4,000 chars from the tail**, joined by the marker `...[truncated]...`. The rendered string is **not** required to be exactly 8,000 chars — the marker adds characters. The verifier timeout defaults to **120s** (`--verify-timeout`, in seconds).
 
 A verification is **stale** — and `passed` no longer counts — after any write: a successful `edit_file` **or** any `shell` execution not on the read-only allowlist (see §27 and architecture §4.8/§4.10).
 

@@ -283,8 +283,8 @@ Example initial policy:
 | List files               | ALLOW   |
 | Read file                | ALLOW   |
 | Search repository        | ALLOW   |
-| Git status               | ALLOW   |
-| Git diff                 | ALLOW   |
+| Git status *(exact argv only)* | ALLOW   |
+| Git diff *(exact argv only)*   | ALLOW   |
 | Run tests / test runners | ASK     |
 | Modify source            | ASK     |
 | Create file              | ASK     |
@@ -310,7 +310,8 @@ classifier and not a sandbox:
 * DENY (advisory, defense in depth, **non-exhaustive**):
   * `argv[0]` in `{curl, wget, ssh, scp, nc, ncat, sudo, su}`.
   * `rm` with both recursive and force flags in any form (e.g. `rm -rf`,
-    `rm -r -f`, `rm --recursive --force`).
+    `rm -r -f`, `rm --recursive --force`). `rm -r` or `rm -f` alone is **not**
+    DENY — it falls through to ASK.
   * Any argument naming `.env`, `.ssh`, `.aws`, `.netrc`, `id_rsa`, or
     `.git-credentials`.
   DENY is final and cannot be overridden by `--yes` or by the model. The list is

@@ -1,0 +1,135 @@
+"""CLI tests: arg parsing, limit resolution, runtime assembly, exit codes (§37)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from coding_agent.cli import (
+    _build_provider,
+    _exit_code,
+    _resolve_limits,
+    build_arg_parser,
+    build_runtime,
+    main,
+)
+from coding_agent.contracts import Limits, SessionState
+from coding_agent.events import NullEventSink
+from coding_agent.providers.mock import MockModelProvider
+from coding_agent.runtime import AgentRuntime
+from coding_agent.verification import DEFAULT_VERIFY_TIMEOUT_S
+
+# --- argument parsing --- #
+
+
+def test_defaults() -> None:
+    args = build_arg_parser().parse_args([])
+    assert args.request == ""
+    assert args.repo == "."
+    assert args.provider == "mock"
+    assert args.verify is None
+    assert args.verify_timeout == DEFAULT_VERIFY_TIMEOUT_S == 120.0
+    assert args.yes is False
+    # Limit overrides default to None so _resolve_limits falls back to Limits().
+    assert args.max_turns is None
+    assert args.max_tool_calls is None
+    assert args.max_time_s is None
+
+
+def test_verify_flags_parse() -> None:
+    args = build_arg_parser().parse_args(
+        ["--verify", "pytest -q", "--verify-timeout", "30", "--yes", "fix it"]
+    )
+    assert args.verify == "pytest -q"
+    assert args.verify_timeout == 30.0
+    assert args.yes is True
+    assert args.request == "fix it"
+
+
+def test_provider_choices_reject_unknown() -> None:
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(["--provider", "openai", "x"])
+
+
+def test_build_provider_mock_and_unknown() -> None:
+    assert isinstance(_build_provider("mock"), MockModelProvider)
+    with pytest.raises(SystemExit):
+        _build_provider("nope")
+
+
+# --- limit resolution (D15: centralized defaults, no scattered magic numbers) --- #
+
+
+def test_resolve_limits_defaults() -> None:
+    args = build_arg_parser().parse_args([])
+    assert _resolve_limits(args) == Limits()
+    assert _resolve_limits(args) == Limits(
+        max_turns=20, max_tool_calls=50, max_time_s=600.0, max_repeated_failures=3
+    )
+
+
+def test_resolve_limits_overrides() -> None:
+    args = build_arg_parser().parse_args(
+        ["--max-turns", "5", "--max-tool-calls", "9", "--max-time", "12.5", "x"]
+    )
+    resolved = _resolve_limits(args)
+    assert resolved.max_turns == 5
+    assert resolved.max_tool_calls == 9
+    assert resolved.max_time_s == 12.5
+    # Not overridable from the CLI; always the centralized default.
+    assert resolved.max_repeated_failures == Limits().max_repeated_failures
+
+
+# --- runtime assembly --- #
+
+
+def test_build_runtime_assembles_session(repo: Path) -> None:
+    args = build_arg_parser().parse_args(
+        ["--repo", str(repo), "--verify", "true", "--verify-timeout", "5", "--yes", "task"]
+    )
+    runtime, session = build_runtime(args, event_sink=NullEventSink())
+    assert isinstance(runtime, AgentRuntime)
+    assert Path(session.repo_root).samefile(repo)
+    assert Path(session.working_dir).samefile(repo)
+    assert session.request == "task"
+    assert session.limits == Limits()
+    assert session.state is SessionState.CREATED
+
+
+def test_build_runtime_accepts_injected_provider(repo: Path) -> None:
+    args = build_arg_parser().parse_args(["--repo", str(repo), "task"])
+    provider = MockModelProvider([])
+    runtime, _session = build_runtime(
+        args, event_sink=NullEventSink(), provider=provider
+    )
+    assert isinstance(runtime, AgentRuntime)
+
+
+# --- exit-code mapping --- #
+
+
+@pytest.mark.parametrize(
+    ("state", "code"),
+    [
+        (SessionState.COMPLETED, 0),
+        (SessionState.COMPLETED_UNVERIFIED, 0),
+        (SessionState.INTERRUPTED, 1),
+        (SessionState.FAILED, 1),
+    ],
+)
+def test_exit_code_mapping(state: SessionState, code: int) -> None:
+    assert _exit_code(state) == code
+
+
+# --- end-to-end through main() (deterministic mock; no network/API key) --- #
+
+
+def test_main_noop_completes_zero(repo: Path) -> None:
+    # Empty mock script -> immediate final answer, no writes -> COMPLETED -> exit 0.
+    assert main(["--repo", str(repo), "--quiet", "do nothing"]) == 0
+
+
+def test_main_time_limit_exits_nonzero(repo: Path) -> None:
+    # --max-time 0 trips the wall-time limit before any model call -> INTERRUPTED -> 1.
+    assert main(["--repo", str(repo), "--quiet", "--max-time", "0", "task"]) == 1

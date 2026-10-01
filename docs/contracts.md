@@ -977,7 +977,6 @@ Changing the meaning of an existing field requires an explicit architecture deci
 Future contracts may add:
 
 ```text
-WriteFileTool
 DeleteFileTool
 MCPTool
 Subagent
@@ -1198,3 +1197,37 @@ EventSink:
 ```
 
 A simple callback sink — not an event bus (see architecture §9, "Avoid premature infrastructure").
+
+---
+
+# 41. write_file
+
+ToolDefinition:
+
+```json
+{
+  "name": "write_file",
+  "description": "Create a new UTF-8 text file, or atomically replace an existing one, with exactly `content`. The parent directory must already exist (missing directories are not created). Path must stay in the workspace.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "path": { "type": "string" },
+      "content": { "type": "string" }
+    },
+    "required": ["path", "content"],
+    "additionalProperties": false
+  },
+  "side_effect": "filesystem_write",
+  "permission": "write"
+}
+```
+
+Behavior (adopted in v0.2; supersedes the §30 deferral of `WriteFileTool` — see D20):
+
+* Creates the file when the target does not exist; atomically replaces it when it does (temp file + `fsync` + rename, preserving the existing mode on replace). The operation never leaves a partially written target.
+* Writes the exact UTF-8 bytes of `content` (a whole-file write — no matching, no diff).
+* Missing parent directories are **not** created implicitly: a missing parent → `EXECUTION_FAILED`.
+* The path must resolve within the workspace; `..` traversal or a symlink whose real target lies outside → `PATH_OUTSIDE_WORKSPACE` (resolved before approval and re-validated after — §17 step 5).
+* Permission class `write` → **ASK**; `--yes` auto-approves ASK only, never DENY (§37).
+* A successful `write_file` is a **write** for staleness (§27, §35, D12): it invalidates a passing verification exactly like `edit_file`.
+* Result output includes `path`, `created` (`true` when a new file was created, `false` when an existing file was replaced), and `bytes_written`.

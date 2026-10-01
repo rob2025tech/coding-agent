@@ -206,7 +206,6 @@ shell
 Future tools may include:
 
 ```text
-write_file
 git
 MCP
 web
@@ -214,7 +213,7 @@ browser
 database
 ```
 
-`write_file` is deferred and should be added only if implementation proves a need (see `docs/decisions.md` D2). `edit_file` modifies an existing file only; it does not create files (see `docs/contracts.md` §38).
+`write_file` was adopted in v0.2 (see `docs/decisions.md` D20 and `docs/contracts.md` §41): it atomically creates a new UTF-8 file or replaces an existing one, and does not create missing parent directories. `edit_file` modifies an existing file only; it does not create files (see `docs/contracts.md` §38).
 
 Every tool must have:
 

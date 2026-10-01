@@ -223,6 +223,29 @@ async def test_readonly_allowlisted_shell_is_not_a_write(workspace: Workspace, p
     assert final.state is SessionState.COMPLETED
 
 
+async def test_write_file_triggers_runtime_verification(workspace: Workspace, pycmd) -> None:
+    # A successful write_file is a D12 write, so the runtime runs the configured
+    # verification on the completion signal and records the result.
+    verify = pycmd(
+        "import pathlib,sys; sys.exit(0 if pathlib.Path('new.txt').read_text() == 'hi' else 1)"
+    )
+    provider = MockModelProvider(
+        [
+            tool_call_response("write_file", {"path": "new.txt", "content": "hi"}),
+            final_response("done"),
+        ]
+    )
+    runtime, session, sink, tracker = _build(workspace, provider, verify=verify)
+    final = await runtime.run(session)
+    assert tracker.ever_wrote is True
+    assert tracker.dirty is False  # the pass cleared staleness (D12)
+    assert final.state is SessionState.COMPLETED
+    assert final.completed_status == "verified"
+    assert len(final.verification_history) == 1
+    assert final.verification_history[0].passed is True
+    assert EventType.VERIFICATION_PASSED in sink.types()
+
+
 # --- D15 runtime limits --- #
 
 

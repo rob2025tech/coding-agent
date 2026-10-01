@@ -301,3 +301,30 @@ chars because the marker adds characters. Updated in contracts §35.
 for v0.1 (`.env`, `.ssh`, `.aws`, `.netrc`, `id_rsa`, `.git-credentials`) and is
 **not** expanded to `.pem`, `id_ed25519`, `.pgpass`, etc. It remains explicitly
 non-exhaustive. No change to architecture §4.8.
+
+---
+
+## D20. write_file adopted (v0.2)
+
+**Decision.** Adopt `write_file` as a v0.2 tool: atomically create a new UTF-8 file
+or replace an existing one with the exact bytes of `content`. Args `{path, content}`
+(both required; `additionalProperties: false`); side effect `filesystem_write`;
+permission `write` (→ ASK). It reuses the existing atomic-write machinery (temp +
+`fsync` + rename, preserving mode on replace) and never leaves a partial target.
+**Missing parent directories are not created implicitly** — a missing parent returns
+a structured `EXECUTION_FAILED`. Path containment and the D6 order are unchanged:
+`..`/symlink escapes return `PATH_OUTSIDE_WORKSPACE` (resolved before approval,
+re-validated after). A successful `write_file` counts as a **write** for D12
+staleness (it invalidates a passing verification, exactly like `edit_file`).
+
+**Rationale.** `edit_file` only modifies an existing file (exact-unique match), so
+v0.1 could not create files at all outside the gated `shell`. D2 deferred
+`write_file` pending a proven need; that need is now clear, and it reuses the
+existing executor / workspace / permission / atomic-write machinery with no
+architectural change.
+
+**Consequences.** Supersedes D2's deferral of `write_file`: `WriteFileTool` moves
+from the contracts §30 deferred list to the authoritative contract §41. Architecture
+§4.5 no longer lists `write_file` under "Future tools." `delete_file` (D18) and all
+other §30 items remain deferred. No change to the shell policy (D5/D16); no network,
+no retries, no provider-SDK coupling.

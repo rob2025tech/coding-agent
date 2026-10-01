@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -209,3 +212,86 @@ async def test_write_tagging_matrix(
         ToolCall("c1", "shell", {"command": command}), session_id=SESSION
     )
     assert result.counts_as_write() is expected
+
+
+# --- write_file (v0.2, D20 / §41): D6 order, ASK, escapes, write tagging --- #
+
+
+async def test_write_file_ask_approved_creates_file(
+    make_executor: Callable[..., ToolExecutor], repo: Path
+) -> None:
+    approver = RecordingApprover(approve=True)
+    sink = ListEventSink()
+    executor = make_executor(approver=approver, sink=sink)
+    result = await executor.execute(
+        ToolCall("c1", "write_file", {"path": "new.txt", "content": "hi\n"}), session_id=SESSION
+    )
+    assert result.status is ToolResultStatus.SUCCESS
+    assert len(approver.calls) == 1  # WRITE -> ASK consulted the approver
+    types = sink.types()
+    assert EventType.PERMISSION_REQUESTED in types
+    assert EventType.PERMISSION_GRANTED in types
+    assert EventType.TOOL_COMPLETED in types
+    assert (repo / "new.txt").read_text(encoding="utf-8") == "hi\n"  # approved write succeeded
+    assert result.counts_as_write() is True  # D12 write tagging
+
+
+async def test_write_file_denied_writes_nothing(
+    make_executor: Callable[..., ToolExecutor], repo: Path
+) -> None:
+    approver = RecordingApprover(approve=False)
+    sink = ListEventSink()
+    executor = make_executor(approver=approver, sink=sink)
+    result = await executor.execute(
+        ToolCall("c1", "write_file", {"path": "new.txt", "content": "hi\n"}), session_id=SESSION
+    )
+    assert result.status is ToolResultStatus.DENIED
+    assert result.error is not None
+    assert result.error.code is ErrorCode.PERMISSION_DENIED
+    assert len(approver.calls) == 1
+    assert not (repo / "new.txt").exists()  # denial leaves nothing behind
+    assert EventType.PERMISSION_DENIED in sink.types()
+    assert EventType.TOOL_STARTED not in sink.types()
+    assert result.counts_as_write() is False
+
+
+async def test_write_file_dotdot_escape_is_rejected(
+    make_executor: Callable[..., ToolExecutor], repo: Path
+) -> None:
+    approver = RecordingApprover(approve=True)
+    executor = make_executor(approver=approver)
+    result = await executor.execute(
+        ToolCall("c1", "write_file", {"path": "../escaped.txt", "content": "x"}),
+        session_id=SESSION,
+    )
+    assert result.error is not None
+    assert result.error.code is ErrorCode.PATH_OUTSIDE_WORKSPACE
+    assert approver.calls == []  # rejected at resolve (D6 step 2), before approval
+    assert not (repo.parent / "escaped.txt").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+async def test_write_file_symlink_escape_is_rejected(
+    make_executor: Callable[..., ToolExecutor], repo: Path
+) -> None:
+    outside = repo.parent / "outside.txt"
+    os.symlink(outside, repo / "link.txt")  # link.txt -> ../outside.txt (escapes workspace)
+    executor = make_executor(approver=RecordingApprover(approve=True))
+    result = await executor.execute(
+        ToolCall("c1", "write_file", {"path": "link.txt", "content": "x"}), session_id=SESSION
+    )
+    assert result.error is not None
+    assert result.error.code is ErrorCode.PATH_OUTSIDE_WORKSPACE
+    assert not outside.exists()  # the real target outside the workspace was never written
+
+
+async def test_write_tagging_write_file_failure_not_a_write(
+    make_executor: Callable[..., ToolExecutor],
+) -> None:
+    executor = make_executor(approver=RecordingApprover(True))
+    result = await executor.execute(
+        ToolCall("c1", "write_file", {"path": "nope/x.txt", "content": "x"}), session_id=SESSION
+    )
+    assert result.error is not None
+    assert result.error.code is ErrorCode.EXECUTION_FAILED  # missing parent (D20)
+    assert result.counts_as_write() is False  # a failed write is not a D12 write

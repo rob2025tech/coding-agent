@@ -1,8 +1,13 @@
-"""File-system tools: ``list_files``, ``read_file``, ``edit_file``.
+"""File-system tools: ``list_files``, ``read_file``, ``edit_file``, ``write_file``.
 
 ``edit_file`` implements the finalized contract (docs/contracts.md §38, D3/D17):
 exact-unique match, UTF-8 only, preserve line endings + trailing newline, atomic
 write (temp + rename), and a short unified diff in the output.
+
+``write_file`` (v0.2; docs/contracts.md §41, D20) atomically creates a new UTF-8
+file or replaces an existing one with the exact bytes of ``content``. It reuses
+``_atomic_write`` and never creates missing parent directories implicitly (a
+missing parent is a structured ``EXECUTION_FAILED``).
 """
 
 from __future__ import annotations
@@ -229,3 +234,75 @@ class EditFileTool(Tool):
             )
 
         return success_result(invocation.tool_call_id, {"path": display, "diff": diff})
+
+
+class WriteFileTool(Tool):
+    """Atomically create or replace a whole UTF-8 file (v0.2; contracts §41, D20).
+
+    Unlike ``edit_file`` (surgical, exact-unique replacement in an EXISTING file),
+    ``write_file`` writes the entire file: creating it when absent, or replacing it
+    atomically when present. Missing parent directories are NOT created implicitly
+    (D20); a missing parent yields a structured ``EXECUTION_FAILED``. Path
+    resolution/containment and the ASK gate are enforced by the executor (D6); a
+    successful write is a D12 write that invalidates a passing verification.
+    """
+
+    @property
+    def definition(self) -> ToolDefinition:
+        # Verbatim from docs/contracts.md §41.
+        return ToolDefinition(
+            name="write_file",
+            description=(
+                "Create a new UTF-8 text file, or atomically replace an existing one, "
+                "with exactly `content`. The parent directory must already exist "
+                "(missing directories are not created). Path must stay in the workspace."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+            side_effect=SideEffect.FILESYSTEM_WRITE,
+            permission=PermissionClass.WRITE,
+        )
+
+    @property
+    def path_arguments(self) -> tuple[str, ...]:
+        return ("path",)
+
+    async def execute(self, invocation: ToolInvocation) -> ToolResult:
+        display = str(invocation.args["path"])
+        path = invocation.paths["path"]
+        content = invocation.args["content"]
+        if not isinstance(content, str):
+            return error_result(
+                invocation.tool_call_id, ErrorCode.INVALID_ARGUMENTS, "content must be a string"
+            )
+
+        # D20: never create missing parent directories implicitly. ``_atomic_write``
+        # uses ``mkstemp(dir=parent)``, which requires the parent to exist; check it
+        # explicitly so a missing parent is a structured EXECUTION_FAILED, not a crash.
+        directory = os.path.dirname(path) or "."
+        if not os.path.isdir(directory):
+            return error_result(
+                invocation.tool_call_id,
+                ErrorCode.EXECUTION_FAILED,
+                f"parent directory does not exist: {display}",
+            )
+
+        created = not os.path.exists(path)
+        try:
+            _atomic_write(path, content.encode("utf-8"))
+        except OSError as exc:
+            return error_result(
+                invocation.tool_call_id, ErrorCode.EXECUTION_FAILED, f"write failed: {exc}"
+            )
+
+        return success_result(
+            invocation.tool_call_id,
+            {"path": display, "created": created, "bytes_written": len(content.encode("utf-8"))},
+        )

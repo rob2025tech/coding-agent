@@ -138,9 +138,9 @@ class Verifier:
 class VerificationTracker:
     """Tracks the D12 write/staleness state used to decide the completion branch.
 
-    A **write** is a successful ``edit_file`` or any non-allowlisted ``shell``
-    execution. ``dirty`` is true when a write occurred since the last passing
-    verification; a pass clears it.
+    A **write** is a successful ``edit_file`` or ``write_file``, or any
+    non-allowlisted ``shell`` execution. ``dirty`` is true when a write occurred
+    since the last passing verification; a pass clears it.
     """
 
     def __init__(self) -> None:

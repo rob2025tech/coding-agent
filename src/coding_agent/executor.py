@@ -193,9 +193,9 @@ class ToolExecutor:
     def _counts_as_write(
         tool_name: str, decision: PermissionDecision, result: ToolResult
     ) -> bool:
-        """D12: a write is a successful edit_file OR a non-allowlisted shell run."""
+        """D12: a write is a successful edit_file/write_file OR a non-allowlisted shell run."""
         ran = result.status not in (ToolResultStatus.DENIED, ToolResultStatus.CANCELLED)
-        if tool_name == "edit_file":
+        if tool_name in ("edit_file", "write_file"):
             return result.status is ToolResultStatus.SUCCESS
         if tool_name == "shell":
             # ALLOW == the read-only allowlist; anything else that ran is a potential write.

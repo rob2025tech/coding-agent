@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from coding_agent.contracts import ErrorCode, ToolResult, ToolResultStatus
-from coding_agent.tools.filesystem import EditFileTool, ListFilesTool, ReadFileTool
+from coding_agent.tools.filesystem import EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool
 from coding_agent.tools.search import SearchTool
 from coding_agent.tools.shell import ShellTool
 
@@ -159,6 +159,68 @@ async def test_edit_file_atomic_preserves_mode_and_leaves_no_temp(
     assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
     leftovers = [name for name in os.listdir(repo) if name.startswith(".edit_")]
     assert leftovers == []
+
+
+# --- write_file (v0.2, D20 / §41) --- #
+
+
+async def test_write_file_creates_new_file_with_exact_bytes(
+    invoke_tool: Invoke, repo: Path
+) -> None:
+    result = await invoke_tool(
+        WriteFileTool(), {"path": "new.txt", "content": "héllo\nline2\n"}
+    )
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.output["path"] == "new.txt"
+    assert result.output["created"] is True
+    written = (repo / "new.txt").read_bytes()
+    assert written == "héllo\nline2\n".encode()  # exact UTF-8 bytes (é -> 0xc3 0xa9)
+    assert result.output["bytes_written"] == len(written)
+
+
+async def test_write_file_overwrites_existing_and_reports_created_false(
+    invoke_tool: Invoke, repo: Path
+) -> None:
+    result = await invoke_tool(
+        WriteFileTool(), {"path": "hello.py", "content": "print('Replaced')\n"}
+    )
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.output["created"] is False
+    assert (repo / "hello.py").read_text(encoding="utf-8") == "print('Replaced')\n"
+
+
+async def test_write_file_missing_parent_dir_is_execution_failed(
+    invoke_tool: Invoke, repo: Path
+) -> None:
+    result = await invoke_tool(WriteFileTool(), {"path": "nope_dir/x.txt", "content": "x"})
+    assert result.status is ToolResultStatus.FAILURE
+    assert result.error is not None
+    assert result.error.code is ErrorCode.EXECUTION_FAILED
+    assert not (repo / "nope_dir").exists()  # parent directory not implicitly created
+
+
+async def test_write_file_is_atomic_preserves_mode_and_leaves_no_temp(
+    invoke_tool: Invoke, repo: Path
+) -> None:
+    target = repo / "moded.txt"
+    target.write_text("old\n", encoding="utf-8")
+    os.chmod(target, 0o600)
+    result = await invoke_tool(WriteFileTool(), {"path": "moded.txt", "content": "new\n"})
+    assert result.status is ToolResultStatus.SUCCESS
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+    assert [name for name in os.listdir(repo) if name.startswith(".edit_")] == []
+
+
+async def test_edit_file_still_does_not_create_files(invoke_tool: Invoke, repo: Path) -> None:
+    # Boundary check: edit_file stays surgical and must NOT create a missing file —
+    # creating files is write_file's job (D20). Guards the edit_file/write_file split.
+    result = await invoke_tool(
+        EditFileTool(), {"path": "brand_new.txt", "old_text": "a", "new_text": "b"}
+    )
+    assert result.status is ToolResultStatus.FAILURE
+    assert result.error is not None
+    assert result.error.code is ErrorCode.EXECUTION_FAILED
+    assert not (repo / "brand_new.txt").exists()
 
 
 # --- shell (D5: shlex + shell=False) --- #

@@ -55,6 +55,15 @@ def test_edit_file_is_ask() -> None:
     assert policy.check(defs["edit_file"], call).decision is ASK
 
 
+def test_write_file_is_ask() -> None:
+    # write_file is a WRITE-class tool (D20 / §41) -> ASK, the same gate as edit_file.
+    policy = PermissionPolicy()
+    defs = _definitions()
+    assert defs["write_file"].permission is PermissionClass.WRITE
+    call = ToolCall("c1", "write_file", {"path": "x.txt", "content": "hi"})
+    assert policy.check(defs["write_file"], call).decision is ASK
+
+
 def test_shell_delegates_to_classifier() -> None:
     policy = PermissionPolicy()
     shell = _definitions()["shell"]

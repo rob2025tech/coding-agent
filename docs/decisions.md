@@ -80,7 +80,7 @@ execute with `shell=False`. ALLOW exact-argv only: `git status`, `git status
 `python`, and any test runner are ASK (unless they are the configured verify
 command run by the Verifier, D4). DENY (advisory, defense in depth): network tools
 (`curl`, `wget`, `ssh`, `scp`, `nc`), `sudo`, recursive force-delete, credential-file
-access — final, not overridable by `--yes` or the model. Everything else: ASK,
+access (full list: see D16 and D20) — final, not overridable by `--yes` or the model. Everything else: ASK,
 showing the full command.
 
 **Rationale.** A small exact-argv allowlist is auditable; DENY adds depth without

@@ -151,10 +151,9 @@ Conceptually:
 
 ```text
 ModelProvider
-├── request(...)
-├── stream(...)
-├── capabilities(...)
-└── model_identity(...)
+├── describe()
+├── generate(request)
+└── stream(request)
 ```
 
 Initial implementations:
@@ -200,19 +199,22 @@ Initial tools:
 list_files
 read_file
 search
+edit_file
 shell
 ```
 
 Future tools may include:
 
 ```text
-edit_file
+write_file
 git
 MCP
 web
 browser
 database
 ```
+
+`write_file` is deferred and should be added only if implementation proves a need (see `docs/decisions.md` D2). `edit_file` modifies an existing file only; it does not create files (see `docs/contracts.md` §38).
 
 Every tool must have:
 
@@ -283,13 +285,44 @@ Example initial policy:
 | Search repository        | ALLOW   |
 | Git status               | ALLOW   |
 | Git diff                 | ALLOW   |
-| Run tests                | ALLOW   |
+| Run tests / test runners | ASK     |
 | Modify source            | ASK     |
 | Create file              | ASK     |
 | Delete file              | ASK     |
 | Git commit               | ASK     |
 | Git push                 | DENY    |
 | Arbitrary network access | DENY    |
+
+### Shell policy (conservative, not a sandbox)
+
+The `shell` tool is gated by a **conservative policy** — not a security
+classifier and not a sandbox:
+
+* Tokenize the command with `shlex` and match against an **exact-argv allowlist**.
+* Reject (→ ASK) any command containing shell metacharacters
+  (`|`, `;`, `&`, `>`, `<`, a backtick, `$( )`, or newlines).
+* Execute with `shell=False`.
+* ALLOW (exact argv only, no other arguments): `git status`,
+  `git status --short`, `git diff`, `git diff --stat`, `git log --oneline -n 20`.
+* `pytest`, `python`, and any test runner are **not** allowlisted — they execute
+  repository code. They are ASK, unless they are the configured verify command
+  run by the Verifier (see §4.10).
+* DENY (advisory, defense in depth, **non-exhaustive**):
+  * `argv[0]` in `{curl, wget, ssh, scp, nc, ncat, sudo, su}`.
+  * `rm` with both recursive and force flags in any form (e.g. `rm -rf`,
+    `rm -r -f`, `rm --recursive --force`).
+  * Any argument naming `.env`, `.ssh`, `.aws`, `.netrc`, `id_rsa`, or
+    `.git-credentials`.
+  DENY is final and cannot be overridden by `--yes` or by the model. The list is
+  a defense-in-depth advisory, not a complete classifier.
+* Everything else: ASK, showing the full command.
+
+The workspace guarantee covers **file tools** only. `shell` is gated by human
+approval, **not** contained: pinning `cwd` does not prevent a command from
+referencing absolute or `../` paths (see §6).
+
+ASK decisions are resolved through an **Approver** (see `docs/contracts.md`
+§37): the CLI prompts interactively; `--yes` auto-approves ASK only, never DENY.
 
 The policy must be independent of the model provider.
 
@@ -310,6 +343,24 @@ Responsibilities:
 * enforce timeouts
 * return structured ToolResults
 * emit execution events
+
+Execution order (authoritative detail in `docs/contracts.md` §17):
+
+```text
+1. schema validation
+2. workspace resolve (file tools)
+3. policy decision
+4. approval (if ASK)
+5. re-validate path at execution time (guards symlink / TOCTOU changes)
+6. timeout-bounded run
+7. structured ToolResult
+8. events
+```
+
+Validation and workspace resolution run **before** the permission decision so a
+human is never asked to approve a call that was always going to fail validation.
+The path is re-validated **after** approval because the filesystem may change in
+between.
 
 The model must never receive direct access to the host operating system.
 
@@ -339,7 +390,31 @@ Success?
             Verify
 ```
 
-Verification may initially use project-provided commands such as tests, linters, type checking, or a simple executable invocation.
+Verification is **runtime-owned**. The model never supplies, alters, or triggers
+the verify command.
+
+* The verify command is **human-supplied** via the CLI flag `--verify "<cmd>"`
+  only (v0.1). Its timeout is set with `--verify-timeout <seconds>` (default
+  120s). The command is a **single argv**: it is run with `shlex.split` and
+  `shell=False`, so shell syntax (pipes, redirection, `&&`) requires a wrapper
+  script invoked as the verify command.
+* A model-requested `shell` call **never** counts as verification, even if its
+  command string matches the verify command.
+* Because the human configured it, the verify command is **pre-authorized** (no
+  ASK). It runs via the Verifier directly — not through the model's tool-call
+  path — with argv from `shlex.split`, `shell=False`, `cwd=repo_root`, and the
+  `--verify-timeout` bound.
+* **Trigger:** when the model signals completion and any **write** has occurred
+  since the last passing verification, the runtime runs the verifier. On failure,
+  the result is appended to context and the loop continues (bounded by limits).
+* **Staleness:** any write after a passing verification invalidates it.
+* A **write** means a successful `edit_file` **or** any `shell` execution that is
+  not on the read-only allowlist (§4.8) — a non-allowlisted shell call is treated
+  as a potential write even if it changes nothing.
+* **No verify command configured:** if no writes occurred → COMPLETED; if writes
+  occurred → COMPLETED_UNVERIFIED.
+
+The `VerificationResult` contract is in `docs/contracts.md` §35.
 
 The agent must not assume that a successful file edit means the task succeeded.
 
@@ -410,13 +485,25 @@ TOOL_RESULT
 MODEL_THINKING
 
 MODEL_THINKING
-  ├── final response → COMPLETED
+  ├── final response → VERIFICATION_CHECK
   └── tool call      → TOOL_REQUESTED
+
+VERIFICATION_CHECK
+  ├── verifier passed → COMPLETED
+  ├── verifier failed → MODEL_THINKING (diagnose; bounded by limits)
+  ├── no verify command & no writes → COMPLETED
+  └── no verify command & writes occurred → COMPLETED_UNVERIFIED
 
 Any active state
   ├── interruption → INTERRUPTED
   └── unrecoverable error → FAILED
 ```
+
+Terminal states: `COMPLETED`, `COMPLETED_UNVERIFIED`, `INTERRUPTED`, `FAILED`.
+
+In `VERIFICATION_CHECK`, a **write** means a successful `edit_file` or any
+non-allowlisted `shell` execution (see §4.10); either invalidates a prior passing
+verification.
 
 The implementation should prevent invalid state transitions.
 
@@ -438,6 +525,8 @@ Tools must not silently operate outside the permitted workspace.
 Path traversal and unsafe filesystem access must be validated before execution.
 
 The initial implementation should prefer explicit workspace boundaries over unrestricted host access.
+
+The workspace guarantee applies to **file tools** (`list_files`, `read_file`, `edit_file`, `search`). The `shell` tool is **not** contained by the workspace: it is gated by human approval (see §4.8), and pinning `cwd` to the repository root does not prevent a command from referencing absolute or `../` paths.
 
 ---
 
@@ -491,6 +580,11 @@ Use `MockModelProvider` to simulate:
 model → tool call → tool result → model → final answer
 ```
 
+The mock provider must be able to script both of these **named scenarios**:
+
+* **Happy path:** read → edit (approved) → completion → runtime verification passes.
+* **Failure path:** verification fails → diagnose → edit → verification passes.
+
 ### Integration tests
 
 Use a temporary fixture repository.
@@ -510,7 +604,7 @@ A test should verify that the agent can:
 3. request an edit
 4. pass the permission gate
 5. modify the file
-6. run verification
+6. pass runtime verification
 7. observe the result
 8. finish successfully
 
@@ -658,7 +752,7 @@ Agent reads hello.py
 
         ↓
 
-Agent proposes modification
+Agent proposes an edit_file modification
 
         ↓
 
@@ -670,7 +764,7 @@ Approved tool executes
 
         ↓
 
-Agent runs verification
+Runtime runs the human-configured verification
 
         ↓
 
@@ -721,3 +815,45 @@ The UI is replaceable.
 The tools are extensible.
 
 The runtime is the product.
+
+---
+
+## 13. Implementation Language & Module Layout (Provisional)
+
+### Language
+
+* Python 3.11+.
+* Stdlib-only core; no vendor SDK types in the core runtime.
+* `async` **only** at the provider and executor boundaries. Pure logic —
+  context building, policy checks, workspace resolution — stays synchronous.
+
+### Provisional module layout
+
+This tree is a **guideline**; implementers may merge trivial modules:
+
+```text
+src/coding_agent/
+├── cli.py
+├── runtime.py
+├── session.py
+├── context.py
+├── permissions.py
+├── executor.py
+├── workspace.py
+├── verification.py
+├── events.py
+├── errors.py
+├── contracts.py
+├── providers/
+│   ├── base.py
+│   └── mock.py
+└── tools/
+    ├── base.py
+    ├── registry.py
+    ├── filesystem.py
+    ├── search.py
+    └── shell.py
+```
+
+The **stable boundaries** listed in `docs/contracts.md` §29 — not the file tree
+— are the contract.

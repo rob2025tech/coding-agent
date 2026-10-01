@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
+import py_compile
+import shlex
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -121,6 +125,54 @@ async def test_verifier_runs_in_repo_root(repo: Path, pycmd: Callable[[str], str
                         repo_root=str(repo))
     result = await verifier.run()
     assert "True" in result.output
+
+
+async def test_verifier_observes_current_source_not_stale_bytecode(repo: Path) -> None:
+    """A Python verifier must observe the CURRENT source, never a stale ``.pyc``.
+
+    Regression for the production defect where a same-byte-length source edit whose
+    mtime second matches the one recorded in an existing timestamp-based ``.pyc``
+    makes CPython treat the stale bytecode as valid — so verification kept failing
+    against the corrected source. ``Verifier.run()`` must isolate bytecode caching so
+    the result always reflects the current tree (D15). No ``sleep`` is used; the stale
+    condition is arranged deterministically via ``os.utime``.
+    """
+    target = repo / "target.py"
+    verify = repo / "verify.py"
+    v1 = "def compute(a, b):\n    return a - b\n"
+    v2 = "def compute(a, b):\n    return a + b\n"
+    assert len(v1.encode()) == len(v2.encode())  # exactly the same byte length
+    target.write_text(v1, encoding="utf-8")
+    verify.write_text(
+        "import target\nraise SystemExit(0 if target.compute(2, 1) == 3 else 1)\n",
+        encoding="utf-8",
+    )
+    verifier = Verifier(f"{shlex.quote(sys.executable)} verify.py", repo_root=str(repo))
+
+    # Run verification once so timestamp-based bytecode for v1 is produced. v1 gives
+    # compute(2, 1) == 1, so this first run legitimately fails.
+    first = await verifier.run()
+    assert first.passed is False
+
+    # Guarantee the timestamp-based .pyc for v1 exists in the workspace and capture the
+    # mtime second it records. (The fix redirects the verifier's own bytecode cache, so
+    # the artifact is planted explicitly to exercise the pre-existing-stale-.pyc path.)
+    py_compile.compile(str(target))
+    recorded_second = int(target.stat().st_mtime)
+    assert list((repo / "__pycache__").glob("target*.pyc"))
+
+    # Replace the source with different contents of exactly the same byte length, then
+    # arrange the mtime so the existing timestamp-based .pyc would still look valid.
+    target.write_text(v2, encoding="utf-8")
+    os.utime(target, (recorded_second, recorded_second))
+    assert int(target.stat().st_mtime) == recorded_second
+    assert target.stat().st_size == len(v2.encode())
+
+    # The second verification must observe the CURRENT source (v2 -> compute(2, 1) == 3)
+    # and pass, rather than executing the stale v1 bytecode.
+    second = await verifier.run()
+    assert second.exit_code == 0
+    assert second.passed is True
 
 
 # --- staleness tracker (D12) --- #

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import os
 import shlex
+import tempfile
 
 from coding_agent.contracts import VerificationResult
 
@@ -78,31 +80,43 @@ class Verifier:
                 timed_out=False,
             )
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=self.repo_root,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except (FileNotFoundError, OSError) as exc:
-            return VerificationResult(
-                passed=False,
-                command=command,
-                output=f"verify command failed to start: {exc}",
-                exit_code=None,
-                ran_at=ran_at,
-                timed_out=False,
-            )
+        # Isolate bytecode caching for the verifier subprocess. A fresh, empty
+        # ``PYTHONPYCACHEPREFIX`` per run guarantees a cache miss, so a Python verifier
+        # recompiles from the CURRENT source instead of trusting a stale timestamp-based
+        # ``.pyc`` in the workspace — which CPython treats as valid when a same-size edit
+        # lands in the same mtime second. Redirecting the cache also keeps ``__pycache__``
+        # out of the repo and is inert for non-Python commands. Only the child environment
+        # changes; argv, cwd, timeout, truncation and exit-code semantics (§35) are intact.
+        with tempfile.TemporaryDirectory(prefix="coding-agent-pycache-") as pycache_prefix:
+            env = {**os.environ, "PYTHONPYCACHEPREFIX": pycache_prefix}
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=self.repo_root,
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except (FileNotFoundError, OSError) as exc:
+                return VerificationResult(
+                    passed=False,
+                    command=command,
+                    output=f"verify command failed to start: {exc}",
+                    exit_code=None,
+                    ran_at=ran_at,
+                    timed_out=False,
+                )
 
-        timed_out = False
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=self.timeout_s)
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
-            stdout_b, stderr_b = b"", b""
-            timed_out = True
+            timed_out = False
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=self.timeout_s
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                stdout_b, stderr_b = b"", b""
+                timed_out = True
 
         combined = stdout_b.decode("utf-8", errors="replace") + stderr_b.decode(
             "utf-8", errors="replace"

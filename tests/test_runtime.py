@@ -10,6 +10,7 @@ import pytest
 from coding_agent.context import ContextBuilder
 from coding_agent.contracts import (
     AgentSession,
+    ErrorCode,
     Limits,
     ModelCapabilities,
     ModelDescriptor,
@@ -27,7 +28,7 @@ from coding_agent.contracts import (
 from coding_agent.errors import ProviderExecutionError
 from coding_agent.events import EventSink, EventType, ListEventSink
 from coding_agent.executor import ToolExecutor
-from coding_agent.permissions import Approver, AutoApprover, PermissionPolicy
+from coding_agent.permissions import Approver, AutoApprover, DenyAllApprover, PermissionPolicy
 from coding_agent.providers.base import ModelProvider
 from coding_agent.providers.mock import (
     MockModelProvider,
@@ -710,3 +711,74 @@ async def test_describe_failure_still_normalizes_as_provider_error(workspace: Wo
     assert "model capability unavailable" not in (final.completed_status or "")
     assert spy.calls == []
     assert final.history == []
+
+
+# --- D23 follow-up: runtime-level DENIED refusal continuation (§27, §31, §34) --- #
+
+
+async def test_denied_refusal_is_appended_and_session_continues(workspace: Workspace) -> None:
+    # D23 / §27 / §34: a refusal is appended as a DENIED ToolResult and the loop
+    # continues to the model instead of ending the session. DenyAllApprover turns the
+    # edit_file ASK into a denial, so no write occurs and the next turn can complete.
+    provider = MockModelProvider(
+        [
+            tool_call_response(
+                "edit_file",
+                {"path": "hello.py", "old_text": "print('Hello')", "new_text": "print('Hi')"},
+            ),
+            final_response("done"),
+        ]
+    )
+    runtime, session, sink, tracker = _build(
+        workspace, provider, verify=None, approver=DenyAllApprover()
+    )
+    final = await runtime.run(session)
+
+    # The refusal did not terminate the session: the model was reached again and the
+    # session then completed normally.
+    assert final.state is SessionState.COMPLETED
+    assert provider.call_count == 2  # the refused turn, then the final-answer turn
+
+    # The DENIED result was appended to its turn and the call to the session history.
+    assert len(final.history) == 2  # the refused tool turn + the final-answer turn
+    denied = final.history[0].tool_results[0]
+    assert denied.status is ToolResultStatus.DENIED
+    assert denied.error is not None
+    assert denied.error.code is ErrorCode.PERMISSION_DENIED
+    assert len(final.tool_call_history) == 1
+    assert final.tool_call_history[0].name == "edit_file"
+
+    # The edit was refused, so nothing was written and nothing is stale.
+    assert tracker.ever_wrote is False
+
+    types = sink.types()
+    assert EventType.PERMISSION_DENIED in types
+    assert EventType.SESSION_COMPLETED in types
+
+
+async def test_repeated_denied_refusals_trip_max_repeated_failures(workspace: Workspace) -> None:
+    # D23 / §34: a refusal counts against max_repeated_failures, so repeated denials
+    # drive the session to FAILED through the existing limit (implementation unchanged).
+    edits = [
+        tool_call_response(
+            "edit_file",
+            {"path": "hello.py", "old_text": "print('Hello')", "new_text": "print('Hi')"},
+        )
+        for _ in range(3)
+    ]
+    provider = MockModelProvider(edits)
+    runtime, session, sink, _t = _build(
+        workspace,
+        provider,
+        limits=Limits(max_repeated_failures=2),
+        approver=DenyAllApprover(),
+    )
+    final = await runtime.run(session)
+
+    assert final.state is SessionState.FAILED
+    assert final.completed_status == "max_repeated_failures exceeded"
+    assert EventType.SESSION_FAILED in sink.types()
+    # Every recorded tool result was a DENIED refusal, not an execution failure.
+    results = [r for turn in final.history for r in turn.tool_results]
+    assert results
+    assert all(r.status is ToolResultStatus.DENIED for r in results)

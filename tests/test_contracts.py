@@ -44,6 +44,21 @@ def test_terminal_states() -> None:
     assert SessionState.TOOL_DENIED not in TERMINAL_STATES
 
 
+def test_d23_reserved_states_are_nonterminal_vocabulary() -> None:
+    # D23 reserves EXECUTING_TOOL, WAITING_FOR_USER, and TOOL_DENIED as conceptual
+    # sub-states of the PERMISSION_CHECK phase that the v0.2 runtime never assigns.
+    # Pin their membership, exact .value identity strings, and non-terminality (§31).
+    reserved = {
+        SessionState.EXECUTING_TOOL: "EXECUTING_TOOL",
+        SessionState.WAITING_FOR_USER: "WAITING_FOR_USER",
+        SessionState.TOOL_DENIED: "TOOL_DENIED",
+    }
+    for state, value in reserved.items():
+        assert state in SessionState  # member exists
+        assert state.value == value  # exact identity string
+        assert state not in TERMINAL_STATES  # non-terminal (contracts §31, D4)
+
+
 def test_string_enums_serialize_by_value() -> None:
     assert StopReason.TOOL_CALL == "tool_call"
     assert StopReason.TOOL_CALL.value == "tool_call"

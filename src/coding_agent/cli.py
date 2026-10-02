@@ -159,11 +159,29 @@ def _exit_code(state: SessionState) -> int:
     return 1
 
 
+def _final_answer(session: AgentSession) -> str | None:
+    """The last final-answer text recorded on the turn history, if any.
+
+    The runtime stores the model's final answer as ``AgentTurn.final_response``
+    (§33) when a turn ends without tool calls; no new session field is invented.
+    """
+    for turn in reversed(session.history):
+        if turn.final_response is not None:
+            return turn.final_response
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     event_sink = _make_sink(args)
     runtime, session = build_runtime(args, event_sink=event_sink)
     final = asyncio.run(runtime.run(session))
+    # The model's final answer is the user-facing result: stdout only, never
+    # duplicated into the stderr event telemetry. Quiet suppresses all output.
+    if not args.quiet:
+        answer = _final_answer(final)
+        if answer:
+            print(answer)
     if not args.quiet:
         print(
             f"[session {final.session_id}] {final.state.value}: {final.completed_status}",

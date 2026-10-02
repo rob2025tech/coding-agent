@@ -156,3 +156,76 @@ def test_main_noop_completes_zero(repo: Path) -> None:
 def test_main_time_limit_exits_nonzero(repo: Path) -> None:
     # --max-time 0 trips the wall-time limit before any model call -> INTERRUPTED -> 1.
     assert main(["--repo", str(repo), "--quiet", "--max-time", "0", "task"]) == 1
+
+
+def test_main_prints_final_answer_to_stdout(
+    repo: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CLI-boundary regression: a successful run must surface the model's final
+    # answer on stdout, while stderr keeps carrying only event/status telemetry.
+    from coding_agent.providers.mock import final_response
+
+    def _scripted(_name: str) -> MockModelProvider:
+        return MockModelProvider([final_response("FINAL-ANSWER-OK")])
+
+    monkeypatch.setattr("coding_agent.cli._build_provider", _scripted)
+    assert main(["--repo", str(repo), "task"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "FINAL-ANSWER-OK"
+    # Telemetry stays on stderr and the answer is never duplicated into it.
+    assert "FINAL-ANSWER-OK" not in captured.err
+    assert "COMPLETED" in captured.err
+
+
+def test_main_recovery_flow_prints_only_corrected_answer(
+    repo: Path,
+    pycmd,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Deterministic CLI recovery acceptance: wrong edit -> verify FAIL -> failure
+    # feedback reaches the next model request -> corrective edit -> verify PASS ->
+    # stdout carries ONLY the corrected final answer (kills forward traversal of
+    # _final_answer(); the intermediate answer must never surface).
+    from coding_agent.providers.mock import final_response, tool_call_response
+
+    provider = MockModelProvider(
+        [
+            tool_call_response(
+                "edit_file",
+                {"path": "hello.py", "old_text": "print('Hello')", "new_text": "print('WRONG')"},
+            ),
+            final_response("first attempt: WRONG-INTERMEDIATE"),
+            tool_call_response(
+                "edit_file",
+                {"path": "hello.py", "old_text": "print('WRONG')", "new_text": "print('TARGET')"},
+            ),
+            final_response("CORRECTED-FINAL-ANSWER"),
+        ]
+    )
+    monkeypatch.setattr("coding_agent.cli._build_provider", lambda _name: provider)
+    verify = pycmd(
+        "import pathlib,sys; sys.exit(0 if 'TARGET' in pathlib.Path('hello.py').read_text() else 1)"
+    )
+
+    assert main(["--repo", str(repo), "--yes", "--verify", verify, "fix hello"]) == 0
+    captured = capsys.readouterr()
+    # Exactly the corrected final answer on stdout; the intermediate one never appears.
+    assert captured.out.strip() == "CORRECTED-FINAL-ANSWER"
+    assert "WRONG-INTERMEDIATE" not in captured.out
+    # Telemetry stays on stderr; the answer is not duplicated into it.
+    assert "CORRECTED-FINAL-ANSWER" not in captured.err
+    assert "verified" in captured.err
+    # Both verification outcomes are observable through the real CLI event stream.
+    assert "VerificationFailed" in captured.err
+    assert "VerificationPassed" in captured.err
+    # Four model turns: bad edit, first answer, corrective edit, corrected answer.
+    assert len(provider.requests) == 4
+    # The request following the failed verification carries the rendered failure
+    # feedback (ContextBuilder's existing representation) back to the model.
+    feedback = "".join(
+        block.text for msg in provider.requests[2].messages for block in msg.content
+    )
+    assert "[verification FAILED]" in feedback

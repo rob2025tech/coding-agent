@@ -1124,7 +1124,18 @@ max_time_s              float   # default 600
 max_repeated_failures   int     # default 3
 ```
 
-Defaults: `max_turns=20`, `max_tool_calls=50`, `max_time_s=600`, `max_repeated_failures=3`. Exceeding a limit transitions the session to `INTERRUPTED` or `FAILED`.
+Defaults: `max_turns=20`, `max_tool_calls=50`, `max_time_s=600`, `max_repeated_failures=3`.
+
+Exceeding a limit transitions the session to a terminal state as follows:
+
+```text
+max_turns              → INTERRUPTED
+max_tool_calls         → INTERRUPTED
+max_time_s             → INTERRUPTED
+max_repeated_failures  → FAILED
+```
+
+The distinction is semantic: `INTERRUPTED` means execution was deliberately stopped because an operational execution bound (`max_turns`, `max_tool_calls`, `max_time_s`) was reached, whereas `FAILED` means the agent loop entered a failure condition. Hitting `max_repeated_failures` is a failure condition — the loop kept producing failed tool results — so it is `FAILED`, not `INTERRUPTED`. This is a clarification of existing behavior; it introduces no new state and changes no transition.
 
 ---
 

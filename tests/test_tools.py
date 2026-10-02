@@ -11,7 +11,13 @@ from pathlib import Path
 import pytest
 
 from coding_agent.contracts import ErrorCode, ToolResult, ToolResultStatus
-from coding_agent.tools.filesystem import EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool
+from coding_agent.tools.filesystem import (
+    DeleteFileTool,
+    EditFileTool,
+    ListFilesTool,
+    ReadFileTool,
+    WriteFileTool,
+)
 from coding_agent.tools.search import SearchTool
 from coding_agent.tools.shell import ShellTool
 
@@ -209,6 +215,46 @@ async def test_write_file_is_atomic_preserves_mode_and_leaves_no_temp(
     assert result.status is ToolResultStatus.SUCCESS
     assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
     assert [name for name in os.listdir(repo) if name.startswith(".edit_")] == []
+
+
+# --- delete_file (v0.2, D25 / §43) --- #
+
+
+async def test_delete_file_removes_existing_file(invoke_tool: Invoke, repo: Path) -> None:
+    result = await invoke_tool(DeleteFileTool(), {"path": "hello.py"})
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.output == {"path": "hello.py"}
+    assert not (repo / "hello.py").exists()
+
+
+async def test_delete_file_nonexistent_is_execution_failed(invoke_tool: Invoke) -> None:
+    result = await invoke_tool(DeleteFileTool(), {"path": "ghost.txt"})
+    assert result.status is ToolResultStatus.FAILURE
+    assert result.error is not None
+    assert result.error.code is ErrorCode.EXECUTION_FAILED
+
+
+async def test_delete_file_directory_is_rejected(invoke_tool: Invoke, repo: Path) -> None:
+    # files only (D25): a directory target is a structured failure, never a recursion.
+    (repo / "adir").mkdir()
+    (repo / "adir" / "inner.txt").write_text("x\n", encoding="utf-8")
+    result = await invoke_tool(DeleteFileTool(), {"path": "adir"})
+    assert result.status is ToolResultStatus.FAILURE
+    assert result.error is not None
+    assert result.error.code is ErrorCode.EXECUTION_FAILED
+    assert (repo / "adir" / "inner.txt").exists()  # nothing under it was touched
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+async def test_delete_file_removes_internal_symlink_not_its_target(
+    invoke_tool: Invoke, repo: Path
+) -> None:
+    # §43: an in-workspace symlink is removed as a link; the target survives.
+    os.symlink("hello.py", repo / "link.py")
+    result = await invoke_tool(DeleteFileTool(), {"path": "link.py"})
+    assert result.status is ToolResultStatus.SUCCESS
+    assert not (repo / "link.py").exists()  # the link is gone...
+    assert (repo / "hello.py").read_text(encoding="utf-8") == "print('Hello')\n"  # target safe
 
 
 async def test_edit_file_still_does_not_create_files(invoke_tool: Invoke, repo: Path) -> None:

@@ -1011,7 +1011,6 @@ Changing the meaning of an existing field requires an explicit architecture deci
 Future contracts may add:
 
 ```text
-DeleteFileTool
 MCPTool
 Subagent
 Skill
@@ -1348,3 +1347,39 @@ Relationship to verification (§35, D4):
   command terminates `COMPLETED_UNVERIFIED` with
   `completed_status` `"completed (no verify command)"`. There is no
   `COMPLETED_VERIFIED` state and none is introduced here.
+
+---
+
+# 43. delete_file
+
+ToolDefinition:
+
+```json
+{
+  "name": "delete_file",
+  "description": "Delete a file from the workspace.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string"
+      }
+    },
+    "required": ["path"],
+    "additionalProperties": false
+  },
+  "side_effect": "destructive",
+  "permission": "destructive"
+}
+```
+
+Behavior (adopted in v0.2; supersedes the §30 deferral of `DeleteFileTool` — see D25):
+
+* Files only: the target must be an existing file. Directories are never deleted (`EXECUTION_FAILED`), and recursive directory deletion is out of scope — this tool must not grow it.
+* A nonexistent target yields a structured `EXECUTION_FAILED`; the tool never raises a raw filesystem error.
+* The path must resolve within the workspace; `..` traversal or an absolute path outside → `PATH_OUTSIDE_WORKSPACE` (resolved before approval and re-validated after — §17 step 5). A symlink whose real target lies outside the workspace → `PATH_OUTSIDE_WORKSPACE`.
+* An in-workspace symlink is removed as a link — its target file is never deleted through it.
+* Permission class `destructive` → **ASK** ("destructive operation requires approval"); `--yes` auto-approves ASK only, never DENY (§37). A denied delete removes nothing and returns `PERMISSION_DENIED` (§18, `DENIED` status).
+* A successful `delete_file` is a **write** for staleness (§27, §35, D12): it invalidates a passing verification exactly like `edit_file`/`write_file`. A failed or denied delete is not a write.
+* Result output includes `path` (the workspace-relative path as requested).
+* The shell path is unchanged: `rm` still routes through the shell policy (D5/D16 — `rm` → ASK, recursive-and-force `rm -rf` → DENY). This tool coexists with it; §12's classification stays advisory metadata.

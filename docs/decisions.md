@@ -600,3 +600,36 @@ approval, pause/resume, new state-change events, executor signature changes, a
 state-transition validator, and the terminality-check duplication noted as an
 observation in D23. No new dependency. The only other documentation change is
 the single-word §6 correction above; no further consistency edits are bundled.
+
+---
+
+## D25. delete_file adopted (v0.2)
+
+**Decision.** Adopt `delete_file` as a v0.2 tool: delete a single existing file
+at a workspace-contained path. Args `{path}` (required; `additionalProperties:
+false`); side effect `destructive`; permission `destructive` (→ ASK via the
+existing policy fallback "destructive operation requires approval"). Files
+only — directories are never deleted and recursive deletion is out of scope;
+nonexistent targets and directory targets return a structured
+`EXECUTION_FAILED`. An in-workspace symlink is removed as a link, never
+through to its target; `..`/symlink escapes return `PATH_OUTSIDE_WORKSPACE`
+(resolved before approval, re-validated after — §17 step 5). A successful
+delete counts as a **write** for D12 staleness (it invalidates a passing
+verification, exactly like `edit_file`/`write_file`); a failed or denied
+delete does not.
+
+**Rationale.** Deletion is the one missing whole-file filesystem capability;
+the readiness review confirmed every required mechanism already exists
+(workspace containment, D6 executor order, the pre-wired `DESTRUCTIVE`
+permission class, structured tool errors, D12 write tagging). Adoption is
+additive: one tool class, one registry entry, and one name added to the
+executor's write-tagging tuple — no new error codes, session states, event
+types, CLI changes, or provider changes.
+
+**Consequences.** Supersedes D18's deferral: `DeleteFileTool` moves from the
+contracts §30 deferred list to the authoritative contract §43. Architecture
+§4.5 gains the adoption sentence. The shell policy is unchanged (D5/D16):
+`rm` remains ASK and recursive-and-force `rm -rf` remains DENY — the tool
+coexists with the shell path. All other §30 items and the D21/D23 deferrals
+(streaming, retries, provider routing/selection, cost/quota, persistence/resume,
+context compaction) remain deferred.

@@ -295,3 +295,93 @@ async def test_write_tagging_write_file_failure_not_a_write(
     assert result.error is not None
     assert result.error.code is ErrorCode.EXECUTION_FAILED  # missing parent (D20)
     assert result.counts_as_write() is False  # a failed write is not a D12 write
+
+
+# --- delete_file (v0.2, D25 / §43): D6 order, ASK, escapes, write tagging --- #
+
+
+async def test_delete_file_ask_approved_removes_file(
+    make_executor: Callable[..., ToolExecutor], repo: Path
+) -> None:
+    (repo / "gone.txt").write_text("bye\n", encoding="utf-8")
+    approver = RecordingApprover(approve=True)
+    sink = ListEventSink()
+    executor = make_executor(approver=approver, sink=sink)
+    result = await executor.execute(
+        ToolCall("c1", "delete_file", {"path": "gone.txt"}), session_id=SESSION
+    )
+    assert result.status is ToolResultStatus.SUCCESS
+    assert len(approver.calls) == 1  # DESTRUCTIVE -> ASK consulted the approver
+    assert not (repo / "gone.txt").exists()
+    types = sink.types()
+    assert EventType.PERMISSION_GRANTED in types
+    assert EventType.TOOL_COMPLETED in types
+    assert result.counts_as_write() is True  # D12: a successful delete is a write
+
+
+async def test_delete_file_denied_removes_nothing(
+    make_executor: Callable[..., ToolExecutor], repo: Path
+) -> None:
+    approver = RecordingApprover(approve=False)
+    executor = make_executor(approver=approver)
+    result = await executor.execute(
+        ToolCall("c1", "delete_file", {"path": "hello.py"}), session_id=SESSION
+    )
+    assert result.status is ToolResultStatus.DENIED
+    assert result.error is not None
+    assert result.error.code is ErrorCode.PERMISSION_DENIED
+    assert (repo / "hello.py").exists()  # denial leaves the file untouched
+    assert result.counts_as_write() is False
+
+
+async def test_delete_file_missing_path_is_invalid_before_approval(
+    make_executor: Callable[..., ToolExecutor],
+) -> None:
+    # §11 + D6 step 1: schema validation precedes the approver.
+    approver = RecordingApprover(approve=True)
+    executor = make_executor(approver=approver)
+    result = await executor.execute(ToolCall("c1", "delete_file", {}), session_id=SESSION)
+    assert result.error is not None
+    assert result.error.code is ErrorCode.INVALID_ARGUMENTS
+    assert approver.calls == []
+
+
+async def test_delete_file_dotdot_escape_is_rejected(
+    make_executor: Callable[..., ToolExecutor],
+) -> None:
+    approver = RecordingApprover(approve=True)
+    executor = make_executor(approver=approver)
+    result = await executor.execute(
+        ToolCall("c1", "delete_file", {"path": "../outside.txt"}), session_id=SESSION
+    )
+    assert result.error is not None
+    assert result.error.code is ErrorCode.PATH_OUTSIDE_WORKSPACE
+    assert approver.calls == []  # rejected at resolve (D6 step 2), before approval
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+async def test_delete_file_symlink_escape_is_rejected(
+    make_executor: Callable[..., ToolExecutor], repo: Path
+) -> None:
+    outside = repo.parent / "outside.txt"
+    outside.write_text("keep\n", encoding="utf-8")
+    os.symlink(outside, repo / "escape.txt")  # link -> outside the workspace
+    executor = make_executor(approver=RecordingApprover(approve=True))
+    result = await executor.execute(
+        ToolCall("c1", "delete_file", {"path": "escape.txt"}), session_id=SESSION
+    )
+    assert result.error is not None
+    assert result.error.code is ErrorCode.PATH_OUTSIDE_WORKSPACE
+    assert outside.exists()  # the real target outside the workspace was never deleted
+
+
+async def test_delete_tagging_failure_not_a_write(
+    make_executor: Callable[..., ToolExecutor],
+) -> None:
+    executor = make_executor(approver=RecordingApprover(True))
+    result = await executor.execute(
+        ToolCall("c1", "delete_file", {"path": "ghost.txt"}), session_id=SESSION
+    )
+    assert result.error is not None
+    assert result.error.code is ErrorCode.EXECUTION_FAILED  # nonexistent target (§43)
+    assert result.counts_as_write() is False  # a failed delete is not a D12 write

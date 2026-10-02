@@ -6,7 +6,13 @@ from collections.abc import Iterable, Iterator
 
 from coding_agent.contracts import ToolDefinition
 from coding_agent.tools.base import Tool
-from coding_agent.tools.filesystem import EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool
+from coding_agent.tools.filesystem import (
+    DeleteFileTool,
+    EditFileTool,
+    ListFilesTool,
+    ReadFileTool,
+    WriteFileTool,
+)
 from coding_agent.tools.search import SearchTool
 from coding_agent.tools.shell import ShellTool
 
@@ -37,10 +43,11 @@ class ToolRegistry:
 
 
 def default_tools() -> list[Tool]:
-    """The tool set: list_files, read_file, search, edit_file, write_file, shell.
+    """The tool set: list_files, read_file, search, edit_file, write_file, delete_file, shell.
 
-    ``write_file`` was adopted in v0.2 (D20; docs/contracts.md §41). ``delete_file``
-    remains deferred (docs/contracts.md §30).
+    ``write_file`` was adopted in v0.2 (D20; docs/contracts.md §41) and
+    ``delete_file`` in v0.2 (D25; docs/contracts.md §43). All other §30 items
+    remain deferred.
     """
     return [
         ListFilesTool(),
@@ -48,6 +55,7 @@ def default_tools() -> list[Tool]:
         SearchTool(),
         EditFileTool(),
         WriteFileTool(),
+        DeleteFileTool(),
         ShellTool(),
     ]
 

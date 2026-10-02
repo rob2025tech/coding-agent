@@ -306,3 +306,63 @@ class WriteFileTool(Tool):
             invocation.tool_call_id,
             {"path": display, "created": created, "bytes_written": len(content.encode("utf-8"))},
         )
+
+
+class DeleteFileTool(Tool):
+    """Delete a single existing file (v0.2; contracts §43, D25).
+
+    Files only — a directory or a missing target yields a structured
+    ``EXECUTION_FAILED``; recursive deletion is out of scope (D25). An
+    in-workspace symlink is removed as a link, never through to its target.
+    Path resolution/containment (including the §17 step-5 execution-time
+    re-check) and the ASK gate are enforced by the executor (D6); a successful
+    delete is a D12 write that invalidates a passing verification.
+    """
+
+    @property
+    def definition(self) -> ToolDefinition:
+        # Verbatim from docs/contracts.md §43.
+        return ToolDefinition(
+            name="delete_file",
+            description="Delete a file from the workspace.",
+            input_schema={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            side_effect=SideEffect.DESTRUCTIVE,
+            permission=PermissionClass.DESTRUCTIVE,
+        )
+
+    @property
+    def path_arguments(self) -> tuple[str, ...]:
+        return ("path",)
+
+    async def execute(self, invocation: ToolInvocation) -> ToolResult:
+        display = str(invocation.args["path"])
+        path = invocation.paths["path"]
+        # lexists (not exists): a dangling in-workspace symlink still exists
+        # as a link and is deletable; only a truly absent path fails.
+        if not os.path.lexists(path):
+            return error_result(
+                invocation.tool_call_id,
+                ErrorCode.EXECUTION_FAILED,
+                f"file does not exist: {display}",
+            )
+        # files only: a real directory is never deleted (D25). An in-workspace
+        # symlink is removed as the link itself, even if it points at a file.
+        if not os.path.islink(path) and os.path.isdir(path):
+            return error_result(
+                invocation.tool_call_id,
+                ErrorCode.EXECUTION_FAILED,
+                f"is a directory; delete_file removes files only: {display}",
+            )
+        try:
+            os.remove(path)
+        except OSError as exc:
+            return error_result(
+                invocation.tool_call_id, ErrorCode.EXECUTION_FAILED, f"delete failed: {exc}"
+            )
+
+        return success_result(invocation.tool_call_id, {"path": display})

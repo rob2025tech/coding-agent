@@ -138,8 +138,8 @@ class Verifier:
 class VerificationTracker:
     """Tracks the D12 write/staleness state used to decide the completion branch.
 
-    A **write** is a successful ``edit_file`` or ``write_file``, or any
-    non-allowlisted ``shell`` execution. ``dirty`` is true when a write occurred
+    A **write** is a successful ``edit_file``, ``write_file``, or ``delete_file``,
+    or any non-allowlisted ``shell`` execution. ``dirty`` is true when a write occurred
     since the last passing verification; a pass clears it.
     """
 

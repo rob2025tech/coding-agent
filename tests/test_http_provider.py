@@ -216,6 +216,7 @@ async def test_request_auth_header_and_no_secret_in_url_or_body() -> None:
     assert sent.method == "POST"
     assert sent.url == ENDPOINT
     assert sent.headers["authorization"] == f"Bearer {SECRET}"
+    assert sent.headers["user-agent"] == "coding-agent"
     assert SECRET not in sent.url
     assert SECRET.encode() not in sent.body
     payload = json.loads(sent.body.decode())

@@ -575,7 +575,7 @@ Path traversal and unsafe filesystem access must be validated before execution.
 
 The initial implementation should prefer explicit workspace boundaries over unrestricted host access.
 
-The workspace guarantee applies to **file tools** (`list_files`, `read_file`, `edit_file`, `search`). The `shell` tool is **not** contained by the workspace: it is gated by human approval (see §4.8), and pinning `cwd` to the repository root does not prevent a command from referencing absolute or `../` paths.
+The workspace guarantee applies to **file tools** (`list_files`, `read_file`, `edit_file`, `write_file`, `search`). The `shell` tool is **not** contained by the workspace: it is gated by human approval (see §4.8), and pinning `cwd` to the repository root does not prevent a command from referencing absolute or `../` paths.
 
 ---
 

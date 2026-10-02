@@ -148,6 +148,13 @@ extended_context
 
 The runtime should reject a task requiring an unavailable capability rather than silently degrading behavior.
 
+v0.2 pins this concretely (D24): the agent loop requires `tool_calling`, so
+`AgentRuntime.run()` rejects a provider whose `describe().capabilities.tool_calling`
+is `false` before the first model turn, through the existing runtime failure path
+(`SessionState.FAILED`) — not as a §25 provider error. No other capability is
+gated in v0.2; in particular `streaming` is **not** required (§26, D9, D13), and
+both shipped providers report `streaming: false`.
+
 ---
 
 # 6. ModelRequest

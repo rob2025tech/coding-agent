@@ -500,3 +500,103 @@ optional test-only follow-up — pinning the reserved vocabulary (membership,
 identity `.value` strings, non-terminality) and the runtime-level
 refusal-continuation path — is **not** part of this decision and would be
 scheduled separately.
+
+---
+
+## D24. Mandatory `tool_calling` capability gate and §6 `write_file` correction (v0.2)
+
+**Decision.** The v0.2 agent loop requires exactly one model capability:
+**`tool_calling`**. `AgentRuntime.run()` checks the provider-neutral
+`ModelDescriptor.capabilities` returned by `describe()` **once per invocation,
+after the session enters `RUNNING` and `SESSION_STARTED` is emitted, and before
+the first `AgentTurn` is created or `generate()` is awaited**. If
+`capabilities.tool_calling` is `false`, the runtime rejects the task through the
+**existing failure path** — `_terminate(session, SessionState.FAILED, reason)` —
+with `completed_status` beginning `model capability unavailable` and naming
+`tool_calling`; the canonical string is `model capability unavailable:
+tool_calling is required for the agent loop`. No new `ErrorCode` is added, and
+the rejection is **not** a `ProviderError`: the `SESSION_FAILED` payload carries
+that reason and **no** `provider_error` key. `MODEL_UNAVAILABLE` (§25) is
+deliberately **not** reused — the provider answered `describe()` correctly and
+has not failed, so classifying a capability mismatch as a provider error would
+misattribute it. If `describe()` itself raises, that *is* a provider failure and
+is normalized through the existing §25 path (`normalize_provider_failure` →
+`FAILED` **with** `provider_error`), never escaping as a raw exception. The gate
+reads only the neutral descriptor: no provider id, model name, or
+vendor-specific branch, and no provider-level `capabilities()` method is
+reintroduced (D13). No other capability is gated — **`streaming` is explicitly
+not required** (§26, D9, D13), and `text`, `vision`, and `reasoning` are not
+gated in v0.2.
+
+Separately, as a documentation consistency correction, `write_file` is added to
+the workspace-guarantee file-tool list in architecture §6. This records what D20
+already specified and the implementation already enforces; it changes no
+workspace or tool semantics.
+
+**Rationale.** Contracts §5 states that "The runtime should reject a task
+requiring an unavailable capability rather than silently degrading behavior",
+but `capabilities` was written by both providers and asserted by descriptor
+tests while **no runtime, CLI, context, or executor code ever read it** — so a
+provider reporting `tool_calling: false` was accepted and the agent degraded
+into a plain chatbot, the exact outcome §5 forbids. This is the same defect
+class D22 closed for architecture §4.6 and D23 closed for architecture §5: a
+normative sentence with no enforcing code and no test. `tool_calling` is the
+right — and only — mandatory capability because the loop is tool-call driven
+(§22, §27) and `ContextBuilder` always sends tool definitions; `streaming`
+cannot be mandatory because the runtime never streams (§26 interface-only,
+D9/D13) and **both** shipped providers report `streaming: false`, so gating it
+would reject the offline default. The check point is the smallest seam
+consistent with the existing runtime: `run()` already owns session state and
+already calls `describe()` for §25 normalization, so the guard is a single
+pre-loop branch beside the existing limit checks, terminating through the same
+`_terminate(..., FAILED, reason)` path those checks use — no turn exists yet, so
+`_finish_turn` (D22) does not apply. Reusing that path rather than §25 keeps the
+classification honest and adds no vocabulary: a capability mismatch is a
+configuration/compatibility rejection, not a provider failure. Doing this in the
+runtime, not the CLI, is required by §5 ("The **runtime** should reject") and
+keeps it provider-neutral per architecture §4.3. The §6 correction is included
+because D20's consequences updated architecture §4.5 only, leaving §6's
+file-tool list implying that `write_file` is outside the workspace guarantee —
+contradicted by D20's own decision text and by two passing escape-rejection
+tests.
+
+**Consequences.** `AgentRuntime.run()` gains one provider-neutral pre-loop
+guard. `contracts.py` is **unchanged**: no new `ErrorCode`, no change to
+`ModelCapabilities`, `ModelDescriptor`, `SessionState`, `TERMINAL_STATES`,
+`EventType`, or any §29 stable boundary. `ModelProvider` keeps exactly
+`describe()`/`generate()`/`stream()` (D13); no provider implementation changes,
+and both shipped providers pass the gate unchanged. The executor, permissions,
+workspace, verification, context, events, tools, and shell policy are
+**unchanged** — the guard runs before any tool call exists, so D22's structural
+backstop and the structural(runtime)/semantic(executor) split are untouched,
+and D23's runtime-assigned state sequence gains no state and loses none. The
+CLI needs no change: `_exit_code` already maps every non-completed terminal
+state to `1`, so a capability rejection exits `1` and prints
+`[session <id>] FAILED: model capability unavailable: …`. Observable outcome on
+rejection: `session.state is SessionState.FAILED`; `completed_status` starts
+with `model capability unavailable` and names `tool_calling`; `SESSION_STARTED`
+then `SESSION_FAILED` are emitted with **no** `provider_error` key in the
+`SESSION_FAILED` payload; `session.history == []` and
+`session.tool_call_history == []`; `generate()` is never called. A `describe()`
+that raises still produces `FAILED` **with** a normalized `provider_error`, so
+§25's "provider failures must not escape" invariant holds. **This supersedes the
+D21 consequence "no change to ... the runtime" only to the extent necessary**
+for this guard; D21's provider neutrality, no-SDK-in-core rule, secret handling,
+finite timeout/`NETWORK_ERROR`, and `CancelledError` re-raise all remain in
+force. D22 remains closed and unmodified, and D23's reserved-state model and
+documentation-only outcome are unaffected. **Not implemented by D24:** the
+runtime guard itself and its tests (a separate implementation task); any
+capability negotiation, fallback, or downgrade; gating of `text`, `vision`,
+`reasoning`, or `streaming`; any requirement for the §5 future capabilities
+(`audio_input`, `audio_output`, `structured_output`, `parallel_tool_calls`,
+`computer_use`, `extended_context`); use of `ModelDescriptor.context_window`,
+`pricing`, or `limits`, which remain unconsumed; any retry of a rejected
+provider; any CLI flag to override the gate; and any change to
+`MockModelProvider`'s or `HttpModelProvider`'s descriptors. **Still deferred
+(§30, architecture §10, D21/D22/D23):** streaming, retries, provider
+routing/selection, cost/quota, persistence/resume, context compaction,
+`delete_file`, and every other §30 item. **Explicitly out of scope:** async
+approval, pause/resume, new state-change events, executor signature changes, a
+state-transition validator, and the terminality-check duplication noted as an
+observation in D23. No new dependency. The only other documentation change is
+the single-word §6 correction above; no further consistency edits are bundled.

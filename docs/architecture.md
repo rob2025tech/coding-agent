@@ -170,6 +170,35 @@ in a URL, contract type, event, or `ProviderError`. Its HTTP traffic is the **mo
 transport** configured by the operator, not an agent network capability, so the
 shell `NETWORK`→DENY policy and arbitrary-shell DENY are unchanged.
 
+`HttpModelProvider` normalizes HTTP outcomes into the §25 vocabulary exactly as
+follows. §25 deliberately stays provider-neutral, so this provider-specific
+table lives here; the behavior is already implemented and test-pinned
+(`tests/test_http_provider.py`), and documenting it changes nothing:
+
+```text
+missing API key (local, no HTTP status)           → AUTHENTICATION_FAILED
+401, 403                                           → AUTHENTICATION_FAILED
+429                                                → RATE_LIMITED (retryable; retry_after_ms from Retry-After)
+413                                                → CONTEXT_TOO_LARGE
+400                                                → CONTEXT_TOO_LARGE if the body signals context overflow,
+                                                     else INVALID_REQUEST
+404                                                → MODEL_UNAVAILABLE if the body signals model-not-found,
+                                                     else PROVIDER_ERROR
+408                                                → NETWORK_ERROR
+any other status (incl. 5xx)                       → PROVIDER_ERROR (conservative fallback, D21)
+transport failure / timeout (OSError, URLError)    → NETWORK_ERROR (D21)
+2xx but malformed response body                    → PROVIDER_ERROR
+```
+
+`asyncio.CancelledError` is re-raised, never normalized (D21). The raw status is
+always preserved in `ProviderError.metadata["http_status"]`; error messages never
+echo the raw response body or any authorization data.
+
+Diagnostic caveat: a 403 from an upstream gateway (WAF bot filtering, plan or
+feature refusal, IP policy) is indistinguishable from an authentication failure
+at this layer and normalizes to `AUTHENTICATION_FAILED` even when the API key is
+valid — diagnose from `metadata["http_status"]`, not from the code alone.
+
 The runtime should not contain provider-specific business logic.
 
 ---

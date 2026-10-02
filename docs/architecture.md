@@ -472,7 +472,7 @@ The event stream should support:
 
 ## 5. Agent State Machine
 
-The initial state machine is:
+The v0.2 runtime-assigned state machine is:
 
 ```text
 CREATED
@@ -484,15 +484,6 @@ MODEL_THINKING
 TOOL_REQUESTED
   ↓
 PERMISSION_CHECK
-  ├── ALLOW → EXECUTING_TOOL
-  ├── ASK   → WAITING_FOR_USER
-  └── DENY  → TOOL_DENIED
-                  ↓
-             TOOL_RESULT
-                  ↓
-             MODEL_THINKING
-
-EXECUTING_TOOL
   ↓
 TOOL_RESULT
   ↓
@@ -519,7 +510,51 @@ In `VERIFICATION_CHECK`, a **write** means a successful `edit_file` or any
 non-allowlisted `shell` execution (see §4.10); either invalidates a prior passing
 verification.
 
-The implementation should prevent invalid state transitions.
+### Runtime-assigned states and reserved sub-states (D23)
+
+The diagram above lists every state the v0.2 runtime assigns. `EXECUTING_TOOL`,
+`WAITING_FOR_USER`, and `TOOL_DENIED` remain `SessionState` members (contracts
+§31) and remain **non-terminal** (D4), but the runtime **does not assign them**;
+they are reserved conceptual sub-states of the `PERMISSION_CHECK` phase.
+
+The runtime sets `PERMISSION_CHECK` once per tool call immediately before
+awaiting `ToolExecutor.execute()`, and `TOOL_RESULT` immediately after it returns
+— whether the call was allowed, approved, or refused. The permission/execution
+outcome is observable through the existing contracts §40 `EventType`s
+(`PermissionRequested`, `PermissionGranted`, `PermissionDenied`, `ToolStarted`,
+`ToolCompleted`, `ToolFailed`) and is contractually represented by
+`ToolResult.status` and `ToolResult.error.code`: a refusal is `status=DENIED`
+with `error.code=PERMISSION_DENIED`. This matches the normative tool loop in
+contracts §27, which describes that phase without naming any state, and contracts
+§37, which requires that "All decisions emit events".
+
+A refusal does not end the session: the runtime appends the denied result, counts
+it against `max_tool_calls` / `max_repeated_failures` (contracts §34), and
+continues — preserving the behavioral intent of the former
+`TOOL_DENIED → TOOL_RESULT` edge.
+
+**Boundary (unchanged).** The runtime remains the sole writer of `session.state`
+and the sole owner of `AgentSession`. The executor remains the only component
+authorized to execute tools and to perform the permission check and approval
+(§4.9, D6), and `ToolExecutor.execute()` continues to receive only `session_id`
+and `turn_id` — never the session.
+
+`WAITING_FOR_USER` cannot be observed by the runtime as things stand:
+`Approver.confirm()` is synchronous and returns `bool` (contracts §37, D7), so
+the runtime is suspended inside `await executor.execute()` for the whole
+permission-and-execution phase. Realizing these three states would require a
+future **async approval seam** (an awaitable `Approver`), which is out of scope
+(D23), as are pause/resume, session persistence, new state-change events,
+executor signature changes, and a state-transition validator.
+
+**Runtime guarantees.** The runtime is the sole writer of `session.state`; it
+assigns only the states in the diagram above; `session.state` has no control-flow
+reader (the loop is driven by limits, the write tracker, and provider responses);
+and every return from `AgentRuntime.run()` passes through the terminal
+transition, so the final state is always one of the four terminal states. Invalid
+transitions are prevented by construction — the runtime never assigns a state
+outside this sequence — rather than by a validator; none exists and none is
+required in v0.2.
 
 ---
 

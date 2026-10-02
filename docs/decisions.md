@@ -417,3 +417,86 @@ neutrality, no-SDK-in-core rule, secret handling, timeout/`NETWORK_ERROR`,
 cost-quota/persistence all remain in force. Executor, permissions, workspace,
 verification, context, events, shell/`NETWORK`→DENY policy, and `ModelMessage` are
 unchanged. No new dependency.
+
+---
+
+## D23. Reserved SessionState permission/execution sub-states (v0.2)
+
+**Decision.** `EXECUTING_TOOL`, `WAITING_FOR_USER`, and `TOOL_DENIED` remain
+`SessionState` members (§31) and remain **non-terminal** (D4), but are
+reclassified as **reserved** conceptual sub-states of the `PERMISSION_CHECK`
+phase that the v0.2 runtime does **not** assign. Architecture §5 is amended so
+its diagram lists only runtime-assigned states — `PERMISSION_CHECK → TOOL_RESULT`
+per tool call, set immediately before and after `await executor.execute()` — and
+so the permission/execution outcome is documented as **observable** through the
+existing §40 `EventType`s (`PermissionRequested`, `PermissionGranted`,
+`PermissionDenied`, `ToolStarted`, `ToolCompleted`, `ToolFailed`) and
+**contractually represented** by `ToolResult.status` and `ToolResult.error.code`
+(a refusal is `status=DENIED` with `error.code=PERMISSION_DENIED`).
+`session.state` is documented as an observational progress marker written solely
+by the runtime, with no control-flow reader. The four terminal states,
+`TERMINAL_STATES`, §31 membership and values, the §40 vocabulary, every §29
+stable boundary, and the executor signature are unchanged. This is a
+**documentation-only** decision: no production code changes and no behavior
+changes.
+
+**Rationale.** Architecture §5 diagrammed
+`PERMISSION_CHECK → {EXECUTING_TOOL | WAITING_FOR_USER | TOOL_DENIED} →
+TOOL_RESULT`, but the runtime performs `PERMISSION_CHECK → TOOL_RESULT` around a
+single opaque `await`, so three of the fourteen declared states were unreachable
+and no test could observe them. Realizing them faithfully is not possible without
+moving a protected boundary: `Approver.confirm()` is synchronous and returns
+`bool` (§37, D7), so the runtime is suspended inside `await executor.execute()`
+for the entire permission-and-execution phase and cannot observe
+`WAITING_FOR_USER`; the executor must remain the only component authorized to
+execute tools and to decide permissions, and keeps receiving only `session_id`
+and `turn_id` (architecture §4.9, D6); and post-hoc inference cannot reconstruct
+the states in any case, because a returned `ToolResult` distinguishes `DENIED`
+from `SUCCESS`/`FAILURE`/`TIMEOUT` but cannot distinguish ALLOW-then-run from
+ASK-approved-then-run. The rest of the contract set already describes this phase
+without states — the normative tool loop (§27) specifies
+`check → DENY: append denied ToolResult, continue → ASK: Approver.confirm →
+execute → append ToolResult → emit events`; §37 requires that "All decisions emit
+events"; and §24/§34 use the "enters / transitions to `<STATE>`" idiom only for
+states the runtime actually assigns — leaving architecture §5 as the sole
+outlier. Amending the documents instead of adding machinery mirrors how D22
+removed the §4.6-vs-§4.9 ambiguity by clarifying the layer split, and follows
+architecture §9 ("do not create abstractions until they have a clear
+responsibility"; "avoid premature infrastructure … unless a demonstrated
+requirement justifies them"; "the runtime decides, the executor performs") and
+§30 ("only when a concrete requirement exists"). The members are **preserved
+rather than removed** because `State` is one of architecture §12's durable
+abstractions and architecture §9's future surfaces (Web UI, VS Code, API) may
+later want live progress, which the existing events already supply.
+
+**Consequences.** `docs/architecture.md` §5 and `docs/contracts.md` §31 are
+clarified as above; no other section changes, and §32's "`to_dict()` is the
+persistence seam" is left as written (no new persistence guarantee is created).
+Behavior is unchanged: `session.state` has no production control-flow reader, all
+readers are terminal-only (`_terminate`'s event selection, the CLI exit code and
+final stderr line) or serialization, `run()` always returns a terminal state
+because every return path funnels through the terminal transition, and no
+existing test asserts an intermediate state — so nothing breaks. A refusal still
+does not end the session: the runtime appends the `DENIED` result, counts it
+against `max_tool_calls`/`max_repeated_failures` (§34), and continues, preserving
+the behavioral intent of the former `TOOL_DENIED → TOOL_RESULT` edge. The
+invalid-transition sentence in architecture §5 is restated as the guarantees the
+runtime actually provides — sole writer, only the diagrammed states,
+always-terminal return — with invalid transitions prevented by construction
+rather than by a validator. **Out of scope:** async approval (an awaitable
+`Approver`), which is the prerequisite for ever realizing `WAITING_FOR_USER`;
+pause/resume; session persistence and any storage backend; new state-change
+events or a `state` field on non-terminal events; executor signature changes or
+passing `AgentSession` to the executor; a state-transition validator; unifying
+the duplicated terminality checks (`TERMINAL_STATES` versus the ad-hoc tuples in
+`runtime.py` and `cli.py`), noted here as an observation only; and the D21/D22
+deferrals — streaming, retries, provider routing/selection, cost/quota, context
+compaction — plus `delete_file` and the rest of §30. **D22 remains closed and
+unmodified:** its provider normalization, runtime structural backstop,
+`FAILED`-not-`PROVIDER_ERROR` classification, absence of a new `ErrorCode`, and
+the structural(runtime)/semantic(executor) split all stand, and the `FAILED`
+transition its backstop performs is retained in architecture §5's diagram. An
+optional test-only follow-up — pinning the reserved vocabulary (membership,
+identity `.value` strings, non-terminality) and the runtime-level
+refusal-continuation path — is **not** part of this decision and would be
+scheduled separately.

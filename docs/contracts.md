@@ -1045,6 +1045,16 @@ INTERRUPTED
 FAILED
 ```
 
+Reserved members (D23): `WAITING_FOR_USER`, `TOOL_DENIED`, and `EXECUTING_TOOL`
+are declared vocabulary that the v0.2 runtime does **not** assign; they are
+conceptual sub-states of the `PERMISSION_CHECK` phase, and all three are
+**non-terminal**. The permission/execution outcome is observable through the §40
+`EventType`s (`PermissionRequested`, `PermissionGranted`, `PermissionDenied`,
+`ToolStarted`, `ToolCompleted`, `ToolFailed`) and is contractually represented by
+`ToolResult.status` and `ToolResult.error.code` — a refusal is `status=DENIED`
+with `error.code=PERMISSION_DENIED`, and per §27 it is appended as a result while
+the session continues (see architecture §5).
+
 Terminal states:
 
 ```text

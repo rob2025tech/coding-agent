@@ -229,3 +229,82 @@ def test_main_recovery_flow_prints_only_corrected_answer(
         block.text for msg in provider.requests[2].messages for block in msg.content
     )
     assert "[verification FAILED]" in feedback
+
+
+def test_main_end_to_end_coding_workflow(
+    repo: Path,
+    pycmd,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Practical coding-workflow acceptance, one CLI invocation, offline and
+    # deterministic: inspect (search) -> edit the located source -> authoritative
+    # verification FAILS on the premature answer -> failure feedback reaches the
+    # model -> corrective edit -> verification PASSES -> only the corrected final
+    # answer surfaces. Verified terminal representation in this repo's reserved
+    # §40 vocabulary is COMPLETED + completed_status "verified" (runtime §27);
+    # there is no COMPLETED_VERIFIED member and this test does not invent one.
+    from coding_agent.providers.mock import final_response, tool_call_response
+
+    provider = MockModelProvider(
+        [
+            tool_call_response("search", {"pattern": "Hello"}),
+            tool_call_response(
+                "edit_file",
+                {
+                    "path": "hello.py",
+                    "old_text": "print('Hello')",
+                    "new_text": "print('Half-fixed')",
+                },
+            ),
+            final_response("attempt 1: PARTIAL-INTERMEDIATE-ANSWER"),
+            tool_call_response(
+                "edit_file",
+                {
+                    "path": "hello.py",
+                    "old_text": "print('Half-fixed')",
+                    "new_text": "print('Fully-fixed')",
+                },
+            ),
+            final_response("E2E-FIX-COMPLETED"),
+        ]
+    )
+    monkeypatch.setattr("coding_agent.cli._build_provider", lambda _name: provider)
+    verify = pycmd(
+        "import pathlib,sys; "
+        "sys.exit(0 if 'Fully-fixed' in pathlib.Path('hello.py').read_text() else 1)"
+    )
+
+    # Turn 1 locates the code, turn 2 edits it, turn 3 answers prematurely and
+    # fails verification, turn 4 corrects, turn 5 answers and verifies clean.
+    assert main(["--repo", str(repo), "--yes", "--verify", verify, "fix the greeting"]) == 0
+    captured = capsys.readouterr()
+
+    # The source file on disk was actually changed by the workflow.
+    content = (repo / "hello.py").read_text()
+    assert "Fully-fixed" in content
+    assert "Hello" not in content
+
+    # stdout carries exactly the corrected final answer; the intermediate never leaks.
+    assert captured.out.strip() == "E2E-FIX-COMPLETED"
+    assert "PARTIAL-INTERMEDIATE-ANSWER" not in captured.out
+
+    # The verification gate failed first, then passed, in that order, and the
+    # session ended as a verified completion.
+    assert "VerificationFailed" in captured.err
+    assert "VerificationPassed" in captured.err
+    assert captured.err.index("VerificationFailed") < captured.err.index("VerificationPassed")
+    assert "COMPLETED" in captured.err
+    assert "verified" in captured.err
+
+    # Five model turns; the inspection result and the verification failure were
+    # both fed back to the model before it performed the corrective edit.
+    assert len(provider.requests) == 5
+    inspect_feedback = "".join(
+        block.text for msg in provider.requests[1].messages for block in msg.content
+    )
+    assert "hello.py" in inspect_feedback
+    failure_feedback = "".join(
+        block.text for msg in provider.requests[3].messages for block in msg.content
+    )
+    assert "[verification FAILED]" in failure_feedback

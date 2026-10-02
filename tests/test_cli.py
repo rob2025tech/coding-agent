@@ -16,6 +16,7 @@ from coding_agent.cli import (
 )
 from coding_agent.contracts import Limits, SessionState
 from coding_agent.events import NullEventSink
+from coding_agent.providers.http import HttpModelProvider
 from coding_agent.providers.mock import MockModelProvider
 from coding_agent.runtime import AgentRuntime
 from coding_agent.verification import DEFAULT_VERIFY_TIMEOUT_S
@@ -56,6 +57,28 @@ def test_build_provider_mock_and_unknown() -> None:
     assert isinstance(_build_provider("mock"), MockModelProvider)
     with pytest.raises(SystemExit):
         _build_provider("nope")
+
+
+def test_provider_http_choice_is_accepted() -> None:
+    args = build_arg_parser().parse_args(["--provider", "http", "x"])
+    assert args.provider == "http"
+
+
+def test_build_provider_http_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODING_AGENT_ENDPOINT", "https://provider.invalid/v1/chat/completions")
+    monkeypatch.setenv("CODING_AGENT_MODEL", "some-model")
+    provider = _build_provider("http")
+    assert isinstance(provider, HttpModelProvider)
+    assert provider.describe().model_id == "some-model"
+
+
+def test_build_provider_http_requires_endpoint_and_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODING_AGENT_ENDPOINT", raising=False)
+    monkeypatch.delenv("CODING_AGENT_MODEL", raising=False)
+    with pytest.raises(SystemExit):
+        _build_provider("http")
 
 
 # --- limit resolution (D15: centralized defaults, no scattered magic numbers) --- #

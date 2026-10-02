@@ -328,3 +328,43 @@ from the contracts §30 deferred list to the authoritative contract §41. Archit
 §4.5 no longer lists `write_file` under "Future tools." `delete_file` (D18) and all
 other §30 items remain deferred. No change to the shell policy (D5/D16); no network,
 no retries, no provider-SDK coupling.
+
+---
+
+## D21. Minimal real HTTP model provider (v0.2)
+
+**Decision.** Add exactly one concrete provider, `HttpModelProvider`
+(`providers/http.py`), behind the existing `ModelProvider` seam. It implements
+`describe()` and `async generate(request)` and leaves `stream()` inherited
+(interface-only, D9). Transport is Python standard library only
+(`urllib.request` run via `asyncio.to_thread`) — **no new dependency** (D1). It
+speaks a single tool-capable wire format (OpenAI-compatible `chat/completions`),
+translating `ModelRequest` → provider JSON and provider JSON → `ModelResponse`
+(tool calls become `ToolCall` objects with **parsed dict** arguments). The API key
+is read from an environment variable (`CODING_AGENT_API_KEY`) at call time and sent
+only as an `Authorization` header; it is never a CLI argument, never hard-coded, and
+never placed in a URL, `ModelRequest`/`ModelResponse`, `metadata`, an event, a tool
+result, or a `ProviderError`. A finite HTTP timeout is enforced; timeouts and
+transport failures normalize to `NETWORK_ERROR`. Provider failures map into the
+existing §25 `ProviderErrorCode` vocabulary by raising `ProviderExecutionError`,
+with conservative `PROVIDER_ERROR` for ambiguous cases; `asyncio.CancelledError` is
+re-raised, never normalized. The transport is injectable so all tests run offline
+with no credentials.
+
+**Rationale.** The mock-based agent loop is complete (architecture §7
+precondition), so the first real provider can be added without touching the core.
+The runtime already depends only on `generate()`/`describe()` and already normalizes
+provider exceptions, so a concrete provider is a pure leaf addition. Staying stdlib
+and single-format keeps the increment small and auditable and preserves provider
+neutrality and the no-SDK-in-core rule.
+
+**Consequences.** No change to `contracts.py` (§3.1/§25/§26 already authorize a
+real provider) or to the runtime, executor, permissions, workspace, verification,
+context, events, or tools. The CLI `--provider` choice set becomes `{mock, http}`;
+`mock` remains the default and offline. Provider HTTP is the *model transport*
+configured by the operator — it is **not** an agent network capability: the shell
+`NETWORK`→DENY policy and arbitrary-shell DENY are unchanged, and no
+network/browser/MCP tool is added. Explicitly out of scope and still deferred (§30):
+streaming, retries, provider routing/selection, cost/quota, persistence/resume, and
+context compaction. Architecture §4.3 lists `HttpModelProvider` alongside
+`MockModelProvider`.

@@ -5,14 +5,16 @@ Flags required by the contracts:
   --verify-timeout <s>    verifier timeout in seconds (default 120, R3)
   --yes                   auto-approve ASK only, never DENY (D7)
 
-v0.1 ships only the deterministic ``mock`` provider, so the CLI never makes a
-paid or external AI call.
+The default provider is the deterministic offline ``mock``. Selecting ``http``
+talks to a real endpoint configured via environment variables (D21); the API key
+is read from ``CODING_AGENT_API_KEY`` and is never a CLI argument.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from collections.abc import Sequence
 
@@ -22,6 +24,7 @@ from coding_agent.events import AgentEvent, CallbackEventSink, EventSink, NullEv
 from coding_agent.executor import ToolExecutor
 from coding_agent.permissions import CliApprover, PermissionPolicy
 from coding_agent.providers.base import ModelProvider
+from coding_agent.providers.http import HttpModelProvider
 from coding_agent.providers.mock import MockModelProvider
 from coding_agent.runtime import AgentRuntime, new_session_id
 from coding_agent.tools.registry import default_registry
@@ -36,7 +39,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("request", nargs="?", default="", help="Task/request for the agent.")
     parser.add_argument("--repo", default=".", help="Repository root (workspace). Default: cwd.")
     parser.add_argument(
-        "--provider", default="mock", choices=["mock"], help="Model provider (v0.1: mock only)."
+        "--provider",
+        default="mock",
+        choices=["mock", "http"],
+        help="Model provider: mock (default, offline) or http (real endpoint via env).",
     )
     parser.add_argument(
         "--verify", default=None, help="Human-supplied verify command (single argv; D14)."
@@ -62,7 +68,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _build_provider(name: str) -> ModelProvider:
     if name == "mock":
         return MockModelProvider([])
-    raise SystemExit(f"unknown provider: {name} (only 'mock' is available in v0.1)")
+    if name == "http":
+        return _build_http_provider()
+    raise SystemExit(f"unknown provider: {name} (available: mock, http)")
+
+
+def _build_http_provider() -> ModelProvider:
+    """Build the HTTP provider from non-secret env config (D21).
+
+    ``CODING_AGENT_ENDPOINT`` (full request URL) and ``CODING_AGENT_MODEL`` are
+    required here; the secret ``CODING_AGENT_API_KEY`` is read lazily by the
+    provider at call time, so it is never a CLI argument and never stored here.
+    """
+    endpoint = os.environ.get("CODING_AGENT_ENDPOINT", "")
+    model = os.environ.get("CODING_AGENT_MODEL", "")
+    if not endpoint or not model:
+        raise SystemExit(
+            "http provider requires CODING_AGENT_ENDPOINT and CODING_AGENT_MODEL "
+            "environment variables"
+        )
+    return HttpModelProvider(endpoint=endpoint, model_id=model)
 
 
 def _resolve_limits(args: argparse.Namespace) -> Limits:

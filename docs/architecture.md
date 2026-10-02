@@ -156,13 +156,19 @@ ModelProvider
 └── stream(request)
 ```
 
-Initial implementations:
+Implementations:
 
 ```text
-MockModelProvider
+MockModelProvider   # deterministic, offline (default)
+HttpModelProvider   # real HTTP endpoint (OpenAI-compatible), stdlib transport
 ```
 
-followed by one or more real providers.
+`HttpModelProvider` (v0.2, D21) adapts a single tool-capable HTTP wire format to
+the provider-neutral contracts using only the standard library; the API key comes
+from an environment variable and is sent only as an `Authorization` header — never
+in a URL, contract type, event, or `ProviderError`. Its HTTP traffic is the **model
+transport** configured by the operator, not an agent network capability, so the
+shell `NETWORK`→DENY policy and arbitrary-shell DENY are unchanged.
 
 The runtime should not contain provider-specific business logic.
 

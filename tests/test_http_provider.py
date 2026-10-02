@@ -349,6 +349,37 @@ async def test_malformed_tool_arguments_maps_to_provider_error() -> None:
     assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
 
 
+async def test_missing_response_id_maps_to_provider_error() -> None:
+    envelope = {"choices": [{"finish_reason": "stop", "message": {}}]}
+    transport = FakeTransport([HttpResponse(200, {}, json.dumps(envelope).encode())])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
+
+
+async def test_non_string_response_id_maps_to_provider_error() -> None:
+    envelope = {"id": 123, "choices": [{"finish_reason": "stop", "message": {}}]}
+    transport = FakeTransport([HttpResponse(200, {}, json.dumps(envelope).encode())])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
+
+
+async def test_empty_response_id_maps_to_provider_error() -> None:
+    envelope = {"id": "", "choices": [{"finish_reason": "stop", "message": {}}]}
+    transport = FakeTransport([HttpResponse(200, {}, json.dumps(envelope).encode())])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
+
+
+async def test_unknown_finish_reason_maps_to_provider_error() -> None:
+    transport = FakeTransport([HttpResponse(200, {}, _text_body("x", finish="weird_reason"))])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
+
+
 # --- authentication / secret handling -------------------------------------- #
 
 

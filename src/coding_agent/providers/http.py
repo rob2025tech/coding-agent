@@ -303,16 +303,19 @@ class HttpModelProvider(ModelProvider):
         tool_calls = self._parse_tool_calls(message.get("tool_calls"), status)
 
         finish = first.get("finish_reason")
-        if isinstance(finish, str):
-            stop_reason = _FINISH_REASON_TO_STOP.get(finish, StopReason.COMPLETED)
-        else:
-            stop_reason = StopReason.COMPLETED
+        if not isinstance(finish, str) or finish not in _FINISH_REASON_TO_STOP:
+            # Only recognized finish reasons are valid; anything else is malformed.
+            raise self._malformed("malformed provider response: unknown finish_reason", status)
+        stop_reason = _FINISH_REASON_TO_STOP[finish]
         if tool_calls and stop_reason is StopReason.COMPLETED:
             stop_reason = StopReason.TOOL_CALL
 
         response_id = body.get("id")
+        if not isinstance(response_id, str) or not response_id:
+            # The provider response id is required; never fabricate an empty one.
+            raise self._malformed("malformed provider response: missing id", status)
         return ModelResponse(
-            response_id=response_id if isinstance(response_id, str) else "",
+            response_id=response_id,
             stop_reason=stop_reason,
             content=content,
             tool_calls=tool_calls,

@@ -117,6 +117,13 @@ async def test_happy_path_verified(workspace: Workspace, pycmd) -> None:
     assert len(final.verification_history) == 1
     assert final.verification_history[0].passed is True
     types = sink.types()
+    # EVT (§40): the model-call and verification boundaries are part of the documented
+    # event surface — pin emission and ordering (no fixed full-sequence coupling).
+    assert EventType.MODEL_REQUESTED in types
+    assert EventType.MODEL_RESPONDED in types
+    assert types.index(EventType.MODEL_REQUESTED) < types.index(EventType.MODEL_RESPONDED)
+    assert EventType.VERIFICATION_STARTED in types
+    assert types.index(EventType.VERIFICATION_STARTED) < types.index(EventType.VERIFICATION_PASSED)
     assert EventType.VERIFICATION_PASSED in types
     assert EventType.SESSION_COMPLETED in types
 
@@ -152,6 +159,9 @@ async def test_failure_path_then_verified(workspace: Workspace, pycmd) -> None:
     assert [v.passed for v in final.verification_history] == [False, True]
     assert tracker.dirty is False
     types = sink.types()
+    # EVT (§40): VERIFICATION_STARTED precedes the completion event of the same run.
+    assert EventType.VERIFICATION_STARTED in types
+    assert types.index(EventType.VERIFICATION_STARTED) < types.index(EventType.VERIFICATION_FAILED)
     assert EventType.VERIFICATION_FAILED in types
     assert EventType.VERIFICATION_PASSED in types
 

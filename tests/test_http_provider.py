@@ -12,6 +12,7 @@ import asyncio
 import json
 import threading
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
@@ -578,3 +579,113 @@ async def test_runtime_normalizes_http_failure_into_session_failed(repo) -> None
     assert failed
     assert failed[0].payload["provider_error"]["code"] == "AUTHENTICATION_FAILED"
     assert SECRET not in json.dumps([event.to_dict() for event in sink.events], default=str)
+
+
+# --- real _urllib_transport acceptance over loopback (T-1) ------------------ #
+
+
+def _localhost_server(
+    responses: list[tuple[int, dict[str, str], bytes]],
+) -> tuple[ThreadingHTTPServer, list[dict[str, Any]]]:
+    """Scripted loopback server: each POST consumes one (status, headers, body).
+
+    Returns the server (the caller shuts it down) and a list accumulating the
+    observed requests as ``{"headers": <lowercased dict>, "body": <bytes>}``.
+    Bound to ``127.0.0.1`` on an ephemeral port: no DNS, no external host, no
+    provider endpoint, no credentials (the fake test key only).
+    """
+    observed: list[dict[str, Any]] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            observed.append(
+                {
+                    "headers": {key.lower(): value for key, value in self.headers.items()},
+                    "body": body,
+                }
+            )
+            status, headers, payload = responses[len(observed) - 1]
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args: Any) -> None:
+            pass  # silence per-request stderr logging
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, observed
+
+
+def _loopback_provider(server: ThreadingHTTPServer) -> HttpModelProvider:
+    """Provider WITHOUT transport injection: generate() runs the real urllib path."""
+    return HttpModelProvider(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}/v1/chat/completions",
+        model_id="test-model",
+        api_key_env=KEY_ENV,
+    )
+
+
+async def test_real_transport_sends_identified_headers_and_parses_200() -> None:
+    # Case A: successful real transport. Pins the wire-level User-Agent fix
+    # (4fe6a21) and the Authorization placement (§25/D21) as actually sent by
+    # _urllib_transport, plus a real 200 body parsed into ModelResponse.
+    server, observed = _localhost_server(
+        [(200, {"Content-Type": "application/json"}, _text_body("localhost-served"))]
+    )
+    try:
+        response = await _loopback_provider(server).generate(_request())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert response.text() == "localhost-served"
+    assert len(observed) == 1
+    headers = observed[0]["headers"]
+    assert headers["user-agent"] == "coding-agent"
+    assert headers["authorization"] == f"Bearer {SECRET}"
+    payload = json.loads(observed[0]["body"].decode())
+    assert payload["model"] == "test-model"
+    assert payload["stream"] is False
+    assert payload["messages"][0] == {"role": "system", "content": "sys"}
+
+
+async def test_real_transport_lowercases_retry_after_for_rate_limit_mapping() -> None:
+    # Case B: the server sends the header with its canonical ``Retry-After``
+    # capitalization; only the transport's response-header lowercasing lets
+    # _error_for_status find it. Pins the load-bearing conversion end-to-end.
+    server, _observed = _localhost_server([(429, {"Retry-After": "2"}, b'{"error":"slow"}')])
+    try:
+        with pytest.raises(ProviderExecutionError) as excinfo:
+            await _loopback_provider(server).generate(_request())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    error = excinfo.value.error
+    assert error.code is ProviderErrorCode.RATE_LIMITED
+    assert error.retryable is True
+    assert error.retry_after_ms == 2000
+    assert error.metadata["http_status"] == 429
+
+
+async def test_real_transport_converts_http_error_into_normalized_provider_error() -> None:
+    # Case C: urllib raises HTTPError on 403; _urllib_transport must convert it
+    # into an HttpResponse so _error_for_status normalizes it (the exact path
+    # the pre-fix live dogfood took). Never a raw transport exception.
+    server, _observed = _localhost_server([(403, {}, b'{"error":"Forbidden by gateway"}')])
+    try:
+        with pytest.raises(ProviderExecutionError) as excinfo:
+            await _loopback_provider(server).generate(_request())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    error = excinfo.value.error
+    assert error.code is ProviderErrorCode.AUTHENTICATION_FAILED
+    assert error.metadata["http_status"] == 403
+    assert error.message == "provider returned HTTP 403"

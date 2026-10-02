@@ -1,4 +1,4 @@
-"""CLI tests: arg parsing, limit resolution, runtime assembly, exit codes (§37)."""
+"""CLI tests: arg parsing, limit resolution, runtime assembly, exit codes (§42)."""
 
 from __future__ import annotations
 

@@ -61,7 +61,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-turns", type=int, default=None, dest="max_turns")
     parser.add_argument("--max-tool-calls", type=int, default=None, dest="max_tool_calls")
     parser.add_argument("--max-time", type=float, default=None, dest="max_time_s")
-    parser.add_argument("--quiet", action="store_true", help="Do not print events to stderr.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress all stdout/stderr output.")
     return parser
 
 

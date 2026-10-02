@@ -1286,3 +1286,65 @@ Behavior (adopted in v0.2; supersedes the §30 deferral of `WriteFileTool` — s
 * Permission class `write` → **ASK**; `--yes` auto-approves ASK only, never DENY (§37).
 * A successful `write_file` is a **write** for staleness (§27, §35, D12): it invalidates a passing verification exactly like `edit_file`.
 * Result output includes `path`, `created` (`true` when a new file was created, `false` when an existing file was replaced), and `bytes_written`.
+
+---
+
+# 42. CLI Output Contract
+
+The reference CLI delivers a finished session to the user through three normative
+channels. This section documents already-implemented, already test-pinned behavior
+(`cli.py`; CLI acceptance tests); it introduces no new state, event, flag, or
+`SessionState` member.
+
+```text
+stdout  the final answer only
+stderr  event telemetry + the terminal status line
+exit    process exit code derived from the terminal SessionState (§31)
+```
+
+Final answer (stdout):
+
+* After the run finishes, the CLI prints the **last** turn whose
+  `final_response` (§33) is not `None` — the session's final answer — to stdout.
+* Intermediate final responses (an earlier answer later superseded by a
+  corrective turn) are never printed; only the last one surfaces.
+* stdout carries no event telemetry, no status line, and no session identifiers.
+
+stderr:
+
+* Each `AgentEvent` (§40) emitted by the runtime is rendered to stderr as a
+  single human-readable line — the
+  "human-readable CLI output" role assigned to the event stream by architecture
+  §4.11.
+* A single terminal status line is then emitted, exactly:
+  `[session <session_id>] <STATE>: <completed_status>`
+  where `<STATE>` is the terminal `SessionState` value (§31) and
+  `<completed_status>` is the runtime-assigned `AgentSession.completed_status`
+  (§32).
+
+Exit codes (terminal `SessionState` §31 → process exit code):
+
+```text
+COMPLETED              → 0
+COMPLETED_UNVERIFIED   → 0
+INTERRUPTED            → 1
+FAILED                 → 1
+```
+
+`--quiet`:
+
+* `--quiet` suppresses **all** CLI output streams: the stdout final answer, the
+  stderr event telemetry, and the stderr terminal status line. The only
+  observable result is the process exit code.
+
+Relationship to verification (§35, D4):
+
+* `VerificationStarted` / `VerificationPassed` / `VerificationFailed` (§40) are
+  stderr **telemetry**, not user-facing results.
+* The verified/unverified outcome is reflected entirely by the existing terminal
+  status semantics (§31/§32): a session that wrote files and passed the
+  human-supplied `--verify` command terminates `COMPLETED` with
+  `completed_status` `"verified"`; a session that wrote but ran no verify
+  command terminates `COMPLETED_UNVERIFIED` with
+  `completed_status` `"completed (no verify command)"`. There is no
+  `COMPLETED_VERIFIED` state and none is introduced here.

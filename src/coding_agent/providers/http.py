@@ -335,11 +335,18 @@ class HttpModelProvider(ModelProvider):
             if not isinstance(function, dict):
                 raise self._malformed("malformed provider response: bad tool_call function", status)
             call_id = item.get("id")
+            if not isinstance(call_id, str) or not call_id:
+                # tool_call_id is required and must be a non-empty string (§14/§22,
+                # D22); never fabricate an empty one.
+                raise self._malformed("malformed provider response: bad tool_call id", status)
             name = function.get("name")
+            if not isinstance(name, str) or not name:
+                # name is required and must be a non-empty string (§14/§22, D22).
+                raise self._malformed("malformed provider response: bad tool_call name", status)
             calls.append(
                 ToolCall(
-                    tool_call_id=call_id if isinstance(call_id, str) else "",
-                    name=name if isinstance(name, str) else "",
+                    tool_call_id=call_id,
+                    name=name,
                     arguments=self._parse_arguments(function.get("arguments", "{}"), status),
                 )
             )

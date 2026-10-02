@@ -12,6 +12,7 @@ import asyncio
 import json
 import threading
 import urllib.error
+from typing import Any
 
 import pytest
 
@@ -120,6 +121,21 @@ def _text_body(text: str, *, finish: str = "stop") -> bytes:
     ).encode()
 
 
+def _tool_call_envelope(tool_call: dict[str, Any]) -> bytes:
+    """A tool-call response envelope wrapping one (possibly invalid) tool call."""
+    return json.dumps(
+        {
+            "id": "r",
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+                }
+            ],
+        }
+    ).encode()
+
+
 class FakeTransport:
     """Replays scripted responses; raises scripted exceptions; records requests."""
 
@@ -173,6 +189,13 @@ async def test_generate_parses_tool_call_with_dict_arguments() -> None:
     assert call.arguments == {"path": "a"}  # parsed to a dict, not a JSON string
     assert response.usage is not None
     assert response.usage.input_tokens == 12
+
+
+async def test_generate_parses_tool_call_with_empty_arguments() -> None:
+    transport = FakeTransport([HttpResponse(200, {}, _tool_call_body("read_file", {}))])
+    response = await _provider(transport).generate(_request())
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].arguments == {}  # empty object is valid (D22)
 
 
 async def test_generate_parses_final_text() -> None:
@@ -344,6 +367,64 @@ async def test_malformed_tool_arguments_maps_to_provider_error() -> None:
     }
     envelope = {"id": "r", "choices": [{"finish_reason": "tool_calls", "message": message}]}
     transport = FakeTransport([HttpResponse(200, {}, json.dumps(envelope).encode())])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
+
+
+async def test_missing_tool_call_id_maps_to_provider_error() -> None:
+    body = _tool_call_envelope(
+        {"type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    )
+    transport = FakeTransport([HttpResponse(200, {}, body)])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
+
+
+async def test_non_string_tool_call_id_maps_to_provider_error() -> None:
+    body = _tool_call_envelope(
+        {"id": 123, "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    )
+    transport = FakeTransport([HttpResponse(200, {}, body)])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
+
+
+async def test_empty_tool_call_id_maps_to_provider_error() -> None:
+    body = _tool_call_envelope(
+        {"id": "", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    )
+    transport = FakeTransport([HttpResponse(200, {}, body)])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
+
+
+async def test_missing_tool_name_maps_to_provider_error() -> None:
+    body = _tool_call_envelope({"id": "c1", "type": "function", "function": {"arguments": "{}"}})
+    transport = FakeTransport([HttpResponse(200, {}, body)])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
+
+
+async def test_non_string_tool_name_maps_to_provider_error() -> None:
+    body = _tool_call_envelope(
+        {"id": "c1", "type": "function", "function": {"name": 123, "arguments": "{}"}}
+    )
+    transport = FakeTransport([HttpResponse(200, {}, body)])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR
+
+
+async def test_empty_tool_name_maps_to_provider_error() -> None:
+    body = _tool_call_envelope(
+        {"id": "c1", "type": "function", "function": {"name": "", "arguments": "{}"}}
+    )
+    transport = FakeTransport([HttpResponse(200, {}, body)])
     with pytest.raises(ProviderExecutionError) as excinfo:
         await _provider(transport).generate(_request())
     assert excinfo.value.error.code is ProviderErrorCode.PROVIDER_ERROR

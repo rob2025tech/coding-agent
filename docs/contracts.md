@@ -390,13 +390,31 @@ A model-generated tool request:
 }
 ```
 
-Required:
+Required fields:
 
 ```text
 tool_call_id
 name
 arguments
 ```
+
+Field invariants (structural validity, D22):
+
+* `tool_call_id` — a non-empty string.
+* `name` — a non-empty string.
+* `arguments` — a JSON object (a `dict`); the empty object `{}` is valid. The core
+  `ToolCall` defaults `arguments` to `{}`, so callers need not pass it explicitly.
+
+A ToolCall is *structurally valid* only when all three invariants hold. Structural
+validity is distinct from tool existence and from tool-specific argument validity:
+whether `name` identifies a registered tool, and whether `arguments` satisfy that
+tool's `input_schema`, are the executor's responsibility (see §17 and architecture
+§4.9), not this shape's. The runtime enforces structural validity before execution
+(architecture §4.6); a provider must normalize a native tool call that violates it
+to `PROVIDER_ERROR` (§22, §25).
+
+`type` is not part of the core ToolCall contract. Provider-native discriminators
+(e.g. `"type": "function"`) must not leak into the core runtime (see §22).
 
 The runtime must treat the model's arguments as untrusted input.
 
@@ -659,7 +677,16 @@ Example:
 
 The runtime converts this into a ToolCall.
 
-The provider's native tool-call object must not leak into the core runtime.
+The provider must translate each native tool call into a *structurally valid*
+ToolCall (§14): `tool_call_id` and `name` must be non-empty strings and
+`arguments` must resolve to a JSON object. A native tool call whose `id`/`name`
+is missing, empty, or non-string, or whose `arguments` cannot be resolved to a
+JSON object, is a malformed provider response and must be normalized to
+`PROVIDER_ERROR` (§25) — never fabricated, silently dropped, or passed through
+with substituted values (D22).
+
+The provider's native tool-call object — including provider-specific
+discriminators such as `"type": "function"` — must not leak into the core runtime.
 
 ---
 

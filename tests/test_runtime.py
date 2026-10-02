@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from typing import Any, cast
+
+import pytest
 
 from coding_agent.context import ContextBuilder
 from coding_agent.contracts import (
@@ -16,10 +19,13 @@ from coding_agent.contracts import (
     ProviderError,
     ProviderErrorCode,
     SessionState,
+    StopReason,
+    ToolCall,
+    ToolResult,
     ToolResultStatus,
 )
 from coding_agent.errors import ProviderExecutionError
-from coding_agent.events import EventType, ListEventSink
+from coding_agent.events import EventSink, EventType, ListEventSink
 from coding_agent.executor import ToolExecutor
 from coding_agent.permissions import Approver, AutoApprover, PermissionPolicy
 from coding_agent.providers.base import ModelProvider
@@ -29,7 +35,7 @@ from coding_agent.providers.mock import (
     tool_call_response,
 )
 from coding_agent.runtime import AgentRuntime
-from coding_agent.tools.registry import default_registry
+from coding_agent.tools.registry import ToolRegistry, default_registry
 from coding_agent.verification import (
     DEFAULT_VERIFY_TIMEOUT_S,
     VerificationTracker,
@@ -46,13 +52,14 @@ def _build(
     verify_timeout: float = DEFAULT_VERIFY_TIMEOUT_S,
     limits: Limits | None = None,
     approver: Approver | None = None,
+    executor: ToolExecutor | None = None,
 ) -> tuple[AgentRuntime, AgentSession, ListEventSink, VerificationTracker]:
     registry = default_registry()
     sink = ListEventSink()
     tracker = VerificationTracker()
     verifier = Verifier(verify, repo_root=workspace.repo_root, timeout_s=verify_timeout)
     context_builder = ContextBuilder(ModelRef.from_descriptor(provider.describe()))
-    executor = ToolExecutor(
+    executor = executor or ToolExecutor(
         registry=registry,
         workspace=workspace,
         policy=PermissionPolicy(),
@@ -405,3 +412,100 @@ async def test_provider_specific_exception_type_does_not_leak(workspace: Workspa
     assert payload["provider_error"]["metadata"]["exception_type"] == "VendorSDKError"
     assert isinstance(payload["provider_error"]["metadata"]["exception_type"], str)
     assert "VendorSDKError" not in (final.completed_status or "")
+
+
+# --- D22 structural backstop: invalid ToolCalls never reach the executor ---- #
+
+
+class _SpyExecutor(ToolExecutor):
+    """Records every ``execute`` call, then delegates to the real executor."""
+
+    def __init__(
+        self,
+        *,
+        registry: ToolRegistry,
+        workspace: Workspace,
+        policy: PermissionPolicy,
+        approver: Approver,
+        event_sink: EventSink,
+        default_timeout_ms: int = 30_000,
+    ) -> None:
+        super().__init__(
+            registry=registry,
+            workspace=workspace,
+            policy=policy,
+            approver=approver,
+            event_sink=event_sink,
+            default_timeout_ms=default_timeout_ms,
+        )
+        self.calls: list[ToolCall] = []
+
+    async def execute(
+        self,
+        call: ToolCall,
+        *,
+        session_id: str,
+        turn_id: str | None = None,
+    ) -> ToolResult:
+        self.calls.append(call)
+        return await super().execute(call, session_id=session_id, turn_id=turn_id)
+
+
+def _spy(workspace: Workspace) -> _SpyExecutor:
+    return _SpyExecutor(
+        registry=default_registry(),
+        workspace=workspace,
+        policy=PermissionPolicy(),
+        approver=AutoApprover(),
+        event_sink=ListEventSink(),
+        default_timeout_ms=30_000,
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_call",
+    [
+        ToolCall(tool_call_id="", name="read_file", arguments={}),
+        ToolCall(tool_call_id="c1", name="", arguments={}),
+        ToolCall(tool_call_id="c1", name="read_file", arguments=cast(Any, "oops")),
+    ],
+)
+async def test_invalid_tool_call_never_reaches_executor(
+    workspace: Workspace, bad_call: ToolCall
+) -> None:
+    provider = MockModelProvider(
+        [
+            ModelResponse(
+                response_id="r1",
+                stop_reason=StopReason.TOOL_CALL,
+                content=[],
+                tool_calls=[bad_call],
+            )
+        ]
+    )
+    spy = _spy(workspace)
+    runtime, session, sink, _t = _build(workspace, provider, executor=spy)
+    final = await runtime.run(session)
+    assert spy.calls == []  # the executor was never reached
+    assert final.state is SessionState.FAILED
+    assert (final.completed_status or "").startswith(
+        "invalid tool call reached runtime boundary"
+    )
+    assert EventType.TOOL_REQUESTED not in sink.types()
+    assert EventType.SESSION_FAILED in sink.types()
+    # D22: the backstop is not classified as a provider error.
+    assert "provider_error" not in sink.of_type(EventType.SESSION_FAILED)[0].payload
+    assert final.tool_call_history == []
+
+
+async def test_valid_tool_call_reaches_executor(workspace: Workspace) -> None:
+    provider = MockModelProvider(
+        [tool_call_response("read_file", {"path": "hello.py"}), final_response("done")]
+    )
+    spy = _spy(workspace)
+    runtime, session, sink, _t = _build(workspace, provider, executor=spy)
+    final = await runtime.run(session)
+    assert len(spy.calls) == 1  # the structurally valid call reached the executor
+    assert spy.calls[0].name == "read_file"
+    assert EventType.TOOL_REQUESTED in sink.types()
+    assert final.state is SessionState.COMPLETED

@@ -22,6 +22,7 @@ from coding_agent.contracts import (
     AgentTurn,
     ProviderError,
     SessionState,
+    ToolCall,
     ToolResultStatus,
 )
 from coding_agent.errors import normalize_provider_failure
@@ -115,6 +116,16 @@ class AgentRuntime:
             if response.tool_calls:
                 session.state = SessionState.TOOL_REQUESTED
                 for call in response.tool_calls:
+                    # Structural backstop (D22): enforce S1-S3 for every provider so
+                    # an invalid ToolCall never reaches the executor. Provider-neutral
+                    # and not a PROVIDER_ERROR (the runtime cannot attribute the
+                    # defect); terminate via the existing failure path with a clear
+                    # boundary diagnostic.
+                    invalid = _invalid_tool_call_reason(call)
+                    if invalid is not None:
+                        return self._finish_turn(
+                            session, turn, turn_id, SessionState.FAILED, invalid
+                        )
                     self._emit(
                         session, EventType.TOOL_REQUESTED, turn_id,
                         tool_name=call.name, tool_call_id=call.tool_call_id,
@@ -258,6 +269,24 @@ class AgentRuntime:
                 payload=payload,
             )
         )
+
+
+def _invalid_tool_call_reason(call: ToolCall) -> str | None:
+    """Structural ToolCall validation (contracts §14, architecture §4.6, D22).
+
+    Returns a boundary diagnostic when ``call`` violates S1-S3 — ``tool_call_id``
+    and ``name`` must be non-empty strings and ``arguments`` must be a ``dict`` —
+    or ``None`` when structurally valid. Tool existence and argument-schema checks
+    are the executor's responsibility, not this guard's.
+    """
+    boundary = "invalid tool call reached runtime boundary"
+    if not isinstance(call.tool_call_id, str) or not call.tool_call_id:
+        return f"{boundary}: tool_call_id must be a non-empty string"
+    if not isinstance(call.name, str) or not call.name:
+        return f"{boundary}: name must be a non-empty string"
+    if not isinstance(call.arguments, dict):
+        return f"{boundary}: arguments must be a dict"
+    return None
 
 
 def new_session_id() -> str:

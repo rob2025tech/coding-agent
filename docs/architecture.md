@@ -246,9 +246,16 @@ arguments
 call ID
 ```
 
-The runtime validates the ToolCall before execution.
+The runtime performs *structural* validation of the ToolCall before execution
+(D22): `tool_call_id` and `name` must be non-empty strings and `arguments` must be
+a dictionary (contracts §14). Structurally invalid tool calls must never reach the
+executor; the runtime terminates the session through its existing failure path with
+a boundary diagnostic. This guard is provider-neutral and is not itself classified
+as a provider error.
 
-Invalid tool calls must never reach the executor.
+Structural validation is distinct from semantic validation. The runtime does not
+check whether `name` identifies a registered tool or whether `arguments` satisfy a
+tool's input schema; those remain executor responsibilities (see §4.9).
 
 ---
 
@@ -342,7 +349,8 @@ The ToolExecutor is the only component authorized to execute tools.
 
 Responsibilities:
 
-* validate tool calls
+* validate tool existence and tool-specific arguments (semantic validation; the
+  runtime has already guaranteed structural validity per §4.6)
 * enforce execution boundaries
 * execute approved operations
 * capture stdout/stderr where applicable

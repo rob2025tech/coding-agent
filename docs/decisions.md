@@ -368,3 +368,52 @@ network/browser/MCP tool is added. Explicitly out of scope and still deferred (�
 streaming, retries, provider routing/selection, cost/quota, persistence/resume, and
 context compaction. Architecture §4.3 lists `HttpModelProvider` alongside
 `MockModelProvider`.
+
+---
+
+## D22. ToolCall structural validation and provider tool-call normalization (v0.2)
+
+**Decision.** A core `ToolCall` is *structurally valid* iff (S1) `tool_call_id` is a
+non-empty string, (S2) `name` is a non-empty string, and (S3) `arguments` is a
+`dict` (the empty `{}` is valid). "Non-empty" means `len(value) > 0`: no `.strip()`,
+whitespace, uniqueness, prefix, regex, or format rule is introduced for
+`tool_call_id` or `name`, and no `type` field is added to the core `ToolCall`.
+Structural validity is enforced at two layers. **(1) Provider normalization (A):**
+`HttpModelProvider` must translate each native tool call into a structurally valid
+`ToolCall`; a native tool call whose `id`/`name` is missing, empty, or non-string,
+or whose `arguments` cannot be resolved to a JSON object, is a malformed provider
+response normalized to `PROVIDER_ERROR` (§25) by raising `ProviderExecutionError` —
+never fabricated as `""`, silently dropped, or passed through with substituted
+values. **(2) Runtime backstop:** before dispatching any tool call, the runtime
+enforces S1-S3 for *every* provider so an invalid `ToolCall` never reaches
+`executor.execute()`. If the backstop fires it terminates the turn/session through
+the existing failure path (`SessionState.FAILED`) with a clear diagnostic that an
+invalid ToolCall reached the runtime boundary. The backstop adds **no** new
+`ErrorCode` and is **not** classified as `PROVIDER_ERROR`, because the runtime
+cannot reliably attribute the defect to a provider. Tool existence
+(`TOOL_NOT_FOUND`) and tool-specific argument-schema validation
+(`INVALID_ARGUMENTS`) remain executor responsibilities and are unchanged.
+
+**Rationale.** `contracts.py` owns data shapes only and performs no runtime
+validation, so the `str`/`dict` annotations are not enforced; previously the HTTP
+parser fabricated `""` for a missing/non-string `id`/`name`, which degraded to a
+misleading downstream `TOOL_NOT_FOUND` and broke outbound tool-result pairing.
+Rejecting at the provider matches how `response_id`, `finish_reason`, and
+`arguments` are already normalized, and the runtime guard makes the architecture
+§4.6 invariant ("invalid tool calls must never reach the executor") hold for any
+provider, not just HTTP. Splitting structural (provider/runtime) from semantic
+(executor) validation removes the §4.6-vs-§4.9 ambiguity: both layers "validate",
+at different scopes.
+
+**Consequences.** `contracts.py` is unchanged — `arguments` keeps
+`default_factory=dict`, so `{}` is valid and callers need not pass it explicitly;
+`docs/contracts.md` §14/§22 and `docs/architecture.md` §4.6/§4.9 are clarified to
+state the invariants and the layer split. `HttpModelProvider._parse_tool_calls`
+rejects a bad `id`/`name` instead of fabricating `""`. The runtime gains a small
+provider-neutral structural guard. This **supersedes the D21 consequence "no change
+to ... the runtime" only to the extent necessary** for this guard; D21's provider
+neutrality, no-SDK-in-core rule, secret handling, timeout/`NETWORK_ERROR`,
+`CancelledError` re-raise, and the deferral of streaming/retries/routing/
+cost-quota/persistence all remain in force. Executor, permissions, workspace,
+verification, context, events, shell/`NETWORK`→DENY policy, and `ModelMessage` are
+unchanged. No new dependency.

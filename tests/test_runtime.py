@@ -509,3 +509,22 @@ async def test_valid_tool_call_reaches_executor(workspace: Workspace) -> None:
     assert spy.calls[0].name == "read_file"
     assert EventType.TOOL_REQUESTED in sink.types()
     assert final.state is SessionState.COMPLETED
+
+
+async def test_valid_tool_call_with_empty_arguments_reaches_executor(
+    workspace: Workspace,
+) -> None:
+    # D22 (audit F-1): arguments={} is structurally valid (S3, contracts §14), so it
+    # must pass the runtime backstop into the executor, preserving the normal flow.
+    provider = MockModelProvider(
+        [tool_call_response("read_file", {}), final_response("done")]
+    )
+    spy = _spy(workspace)
+    runtime, session, sink, _t = _build(workspace, provider, executor=spy)
+    final = await runtime.run(session)
+    assert len(spy.calls) == 1  # the executor was reached
+    assert spy.calls[0].tool_call_id  # non-empty string tool_call_id
+    assert spy.calls[0].name == "read_file"  # non-empty string name
+    assert spy.calls[0].arguments == {}  # {} passed through untouched
+    assert EventType.TOOL_REQUESTED in sink.types()  # the backstop did not fire
+    assert final.state is SessionState.COMPLETED  # existing success behavior

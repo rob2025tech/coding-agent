@@ -92,6 +92,26 @@ _FINISH_REASON_TO_STOP: dict[str, StopReason] = {
 }
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects before urllib can forward the Authorization header.
+
+    ``urllib`` copies non-content headers (including ``authorization``) onto a
+    redirect request. The provider endpoint is exact, so a 3xx is returned to
+    the existing ``HTTPError`` normalization path instead of being followed.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
 class HttpModelProvider(ModelProvider):
     """A single-endpoint HTTP provider speaking an OpenAI-compatible format.
 
@@ -172,8 +192,9 @@ class HttpModelProvider(ModelProvider):
         req = urllib.request.Request(
             request.url, data=request.body, headers=request.headers, method=request.method
         )
+        opener = urllib.request.build_opener(_NoRedirectHandler())
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
+            with opener.open(req, timeout=self._timeout_s) as resp:
                 return HttpResponse(
                     status=int(resp.status),
                     headers={key.lower(): value for key, value in resp.headers.items()},

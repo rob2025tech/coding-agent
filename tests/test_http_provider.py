@@ -587,17 +587,19 @@ async def test_runtime_normalizes_http_failure_into_session_failed(repo) -> None
 def _localhost_server(
     responses: list[tuple[int, dict[str, str], bytes]],
 ) -> tuple[ThreadingHTTPServer, list[dict[str, Any]]]:
-    """Scripted loopback server: each POST consumes one (status, headers, body).
+    """Scripted loopback server: each request consumes one (status, headers, body).
 
     Returns the server (the caller shuts it down) and a list accumulating the
     observed requests as ``{"headers": <lowercased dict>, "body": <bytes>}``.
+    GET is recorded too, so a followed redirect (urllib turns 301/302/303 POSTs
+    into GETs) cannot reach a sink server unnoticed.
     Bound to ``127.0.0.1`` on an ephemeral port: no DNS, no external host, no
     provider endpoint, no credentials (the fake test key only).
     """
     observed: list[dict[str, Any]] = []
 
     class _Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
+        def _handle(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length)
             observed.append(
@@ -612,6 +614,12 @@ def _localhost_server(
                 self.send_header(key, value)
             self.end_headers()
             self.wfile.write(payload)
+
+        def do_GET(self) -> None:
+            self._handle()
+
+        def do_POST(self) -> None:
+            self._handle()
 
         def log_message(self, *_args: Any) -> None:
             pass  # silence per-request stderr logging
@@ -689,3 +697,33 @@ async def test_real_transport_converts_http_error_into_normalized_provider_error
     assert error.code is ProviderErrorCode.AUTHENTICATION_FAILED
     assert error.metadata["http_status"] == 403
     assert error.message == "provider returned HTTP 403"
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+async def test_real_transport_never_follows_redirects(status: int) -> None:
+    # Security: urllib copies non-content headers (including Authorization) onto
+    # a redirect request. A 3xx must be surfaced as an error instead of followed.
+    sink, sink_observed = _localhost_server(
+        [(200, {"Content-Type": "application/json"}, _text_body("must-not-be-served"))]
+    )
+    source, source_observed = _localhost_server(
+        [(status, {"Location": f"http://127.0.0.1:{sink.server_address[1]}/sink"}, b"")]
+    )
+    try:
+        with pytest.raises(ProviderExecutionError) as excinfo:
+            await _loopback_provider(source).generate(_request())
+    finally:
+        source.shutdown()
+        source.server_close()
+        sink.shutdown()
+        sink.server_close()
+
+    # The target receives no request at all, so it cannot receive Authorization.
+    assert sink_observed == []
+    assert len(source_observed) == 1
+    assert source_observed[0]["headers"]["authorization"] == f"Bearer {SECRET}"
+    error = excinfo.value.error
+    assert error.code is ProviderErrorCode.PROVIDER_ERROR
+    assert error.metadata["http_status"] == status
+    assert error.message == f"provider returned HTTP {status}"
+    assert SECRET not in error.message

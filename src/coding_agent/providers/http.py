@@ -80,6 +80,10 @@ Transport = Callable[[HttpRequest], HttpResponse]
 #: wall-clock limit stays meaningful; a timeout normalizes to ``NETWORK_ERROR``.
 DEFAULT_HTTP_TIMEOUT_S = 60.0
 
+#: Hard cap on a response body read from the wire. Reads request one extra byte
+#: so an over-limit body is detected without trusting ``Content-Length``.
+MAX_RESPONSE_BODY_BYTES = 1_048_576
+
 #: Environment variable holding the API key. Never a CLI argument (D21).
 DEFAULT_API_KEY_ENV = "CODING_AGENT_API_KEY"
 
@@ -198,14 +202,14 @@ class HttpModelProvider(ModelProvider):
                 return HttpResponse(
                     status=int(resp.status),
                     headers={key.lower(): value for key, value in resp.headers.items()},
-                    body=resp.read(),
+                    body=resp.read(MAX_RESPONSE_BODY_BYTES + 1),
                 )
         except urllib.error.HTTPError as exc:  # a real HTTP response carrying an error status
             items = exc.headers.items() if exc.headers is not None else []
             return HttpResponse(
                 status=int(exc.code),
                 headers={str(key).lower(): str(value) for key, value in items},
-                body=exc.read(),
+                body=exc.read(MAX_RESPONSE_BODY_BYTES + 1),
             )
 
     # -- request building ---------------------------------------------------- #
@@ -296,6 +300,9 @@ class HttpModelProvider(ModelProvider):
     def _to_model_response(self, response: HttpResponse) -> ModelResponse:
         if response.status != 200:
             raise self._error_for_status(response)
+        # Defense in depth for injected transports that bypass _urllib_transport.
+        if len(response.body) > MAX_RESPONSE_BODY_BYTES:
+            raise self._oversized(response.status)
         try:
             body = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -403,6 +410,7 @@ class HttpModelProvider(ModelProvider):
 
     def _error_for_status(self, response: HttpResponse) -> ProviderExecutionError:
         status = response.status
+        oversized = len(response.body) > MAX_RESPONSE_BODY_BYTES
         retryable = False
         retry_after_ms: int | None = None
         code: ProviderErrorCode
@@ -415,17 +423,18 @@ class HttpModelProvider(ModelProvider):
         elif status == 413:
             code = ProviderErrorCode.CONTEXT_TOO_LARGE
         elif status == 400:
+            # An oversized/truncated body is never signal-scanned.
             code = (
                 ProviderErrorCode.CONTEXT_TOO_LARGE
-                if _signals_context_overflow(response.body)
+                if not oversized and _signals_context_overflow(response.body)
                 else ProviderErrorCode.INVALID_REQUEST
             )
         elif status == 404:
-            # An explicit model-not-found signal -> MODEL_UNAVAILABLE; a generic or
-            # ambiguous 404 (e.g. a wrong path) -> conservative PROVIDER_ERROR.
+            # An explicit model-not-found signal -> MODEL_UNAVAILABLE; a generic,
+            # ambiguous, or oversized/truncated 404 -> conservative PROVIDER_ERROR.
             code = (
                 ProviderErrorCode.MODEL_UNAVAILABLE
-                if _signals_model_not_found(response.body)
+                if not oversized and _signals_model_not_found(response.body)
                 else ProviderErrorCode.PROVIDER_ERROR
             )
         elif status == 408:
@@ -433,6 +442,9 @@ class HttpModelProvider(ModelProvider):
         else:
             # 5xx and any unclassified status: conservative fallback.
             code = ProviderErrorCode.PROVIDER_ERROR
+        metadata: dict[str, Any] = {"http_status": status}
+        if oversized:
+            metadata["body_limit_bytes"] = MAX_RESPONSE_BODY_BYTES
         return ProviderExecutionError(
             ProviderError(
                 code=code,
@@ -441,7 +453,17 @@ class HttpModelProvider(ModelProvider):
                 retryable=retryable,
                 retry_after_ms=retry_after_ms,
                 provider_id=self._provider_id,
-                metadata={"http_status": status},
+                metadata=metadata,
+            )
+        )
+
+    def _oversized(self, status: int) -> ProviderExecutionError:
+        return ProviderExecutionError(
+            ProviderError(
+                code=ProviderErrorCode.PROVIDER_ERROR,
+                message=f"provider response body exceeds {MAX_RESPONSE_BODY_BYTES} bytes",
+                provider_id=self._provider_id,
+                metadata={"http_status": status, "body_limit_bytes": MAX_RESPONSE_BODY_BYTES},
             )
         )
 

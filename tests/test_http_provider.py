@@ -727,3 +727,151 @@ async def test_real_transport_never_follows_redirects(status: int) -> None:
     assert error.metadata["http_status"] == status
     assert error.message == f"provider returned HTTP {status}"
     assert SECRET not in error.message
+
+
+# --- response body size limit ---------------------------------------------- #
+
+BODY_SENTINEL = "BODY_LEAK_SENTINEL"
+
+
+def _json_of_size(size: int) -> bytes:
+    """A minimal valid completion JSON padded to exactly ``size`` bytes."""
+    base = b'{"id":"r","choices":[{"finish_reason":"stop","message":{}}],"pad":""}'
+    padding = size - len(base)
+    assert padding >= 0
+    return base.replace(b'""', b'"' + b"x" * padding + b'"')
+
+
+def _oversized_body() -> bytes:
+    return BODY_SENTINEL.encode() + b"x" * 64
+
+
+async def test_oversized_success_is_rejected_before_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("coding_agent.providers.http.MAX_RESPONSE_BODY_BYTES", 64)
+    transport = FakeTransport([HttpResponse(200, {}, _oversized_body())])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    error = excinfo.value.error
+    assert error.code is ProviderErrorCode.PROVIDER_ERROR
+    assert error.message == "provider response body exceeds 64 bytes"
+    assert error.metadata == {"http_status": 200, "body_limit_bytes": 64}
+    assert BODY_SENTINEL not in json.dumps(error.to_dict())
+
+
+async def test_oversized_error_preserves_auth_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("coding_agent.providers.http.MAX_RESPONSE_BODY_BYTES", 64)
+    transport = FakeTransport([HttpResponse(401, {}, _oversized_body())])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    error = excinfo.value.error
+    assert error.code is ProviderErrorCode.AUTHENTICATION_FAILED
+    assert error.metadata == {"http_status": 401, "body_limit_bytes": 64}
+    assert BODY_SENTINEL not in json.dumps(error.to_dict())
+
+
+async def test_oversized_error_preserves_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("coding_agent.providers.http.MAX_RESPONSE_BODY_BYTES", 64)
+    transport = FakeTransport([HttpResponse(429, {"retry-after": "5"}, _oversized_body())])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    error = excinfo.value.error
+    assert error.code is ProviderErrorCode.RATE_LIMITED
+    assert error.retryable is True
+    assert error.retry_after_ms == 5000
+    assert error.metadata == {"http_status": 429, "body_limit_bytes": 64}
+
+
+async def test_oversized_400_is_not_scanned_for_context_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("coding_agent.providers.http.MAX_RESPONSE_BODY_BYTES", 64)
+    body = b'{"error":"maximum context length exceeded"}' + b"x" * 64
+    transport = FakeTransport([HttpResponse(400, {}, body)])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    error = excinfo.value.error
+    assert error.code is ProviderErrorCode.INVALID_REQUEST
+    assert error.metadata["body_limit_bytes"] == 64
+
+
+async def test_oversized_404_is_not_scanned_for_model_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("coding_agent.providers.http.MAX_RESPONSE_BODY_BYTES", 64)
+    body = b'{"error":"model does not exist"}' + b"x" * 64
+    transport = FakeTransport([HttpResponse(404, {}, body)])
+    with pytest.raises(ProviderExecutionError) as excinfo:
+        await _provider(transport).generate(_request())
+    error = excinfo.value.error
+    assert error.code is ProviderErrorCode.PROVIDER_ERROR
+    assert error.metadata["body_limit_bytes"] == 64
+
+
+@pytest.mark.parametrize(("size", "accepted"), [(128, True), (129, False)])
+async def test_body_limit_boundary_is_inclusive(
+    size: int, accepted: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("coding_agent.providers.http.MAX_RESPONSE_BODY_BYTES", 128)
+    body = _json_of_size(size)
+    assert len(body) == size
+    transport = FakeTransport([HttpResponse(200, {}, body)])
+    if accepted:
+        response = await _provider(transport).generate(_request())
+        assert response.response_id == "r"
+    else:
+        with pytest.raises(ProviderExecutionError) as excinfo:
+            await _provider(transport).generate(_request())
+        error = excinfo.value.error
+        assert error.code is ProviderErrorCode.PROVIDER_ERROR
+        assert error.metadata == {"http_status": 200, "body_limit_bytes": 128}
+
+
+async def test_real_transport_caps_oversized_success_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("coding_agent.providers.http.MAX_RESPONSE_BODY_BYTES", 64)
+    server, _observed = _localhost_server(
+        [(200, {"Content-Type": "application/json"}, _oversized_body())]
+    )
+    try:
+        with pytest.raises(ProviderExecutionError) as excinfo:
+            await _loopback_provider(server).generate(_request())
+    finally:
+        server.shutdown()
+        server.server_close()
+    error = excinfo.value.error
+    assert error.code is ProviderErrorCode.PROVIDER_ERROR
+    assert error.metadata == {"http_status": 200, "body_limit_bytes": 64}
+    assert BODY_SENTINEL not in json.dumps(error.to_dict())
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(200, ProviderErrorCode.PROVIDER_ERROR), (400, ProviderErrorCode.INVALID_REQUEST)],
+)
+async def test_real_transport_ignores_misleading_content_length(
+    status: int, expected: ProviderErrorCode, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An overstated Content-Length must not cause IncompleteRead; the capped read
+    # returns after MAX_RESPONSE_BODY_BYTES + 1 bytes on both paths.
+    monkeypatch.setattr("coding_agent.providers.http.MAX_RESPONSE_BODY_BYTES", 64)
+    server, _observed = _localhost_server(
+        [(status, {"Content-Length": "999999999"}, _oversized_body())]
+    )
+    try:
+        with pytest.raises(ProviderExecutionError) as excinfo:
+            await _loopback_provider(server).generate(_request())
+    finally:
+        server.shutdown()
+        server.server_close()
+    error = excinfo.value.error
+    assert error.code is expected
+    assert error.metadata["http_status"] == status
+    assert error.metadata["body_limit_bytes"] == 64
+    assert BODY_SENTINEL not in json.dumps(error.to_dict())

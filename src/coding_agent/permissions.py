@@ -12,7 +12,7 @@ from __future__ import annotations
 import shlex
 import sys
 from collections.abc import Callable
-from typing import Protocol
+from typing import Any, Protocol
 
 from coding_agent.contracts import (
     PermissionClass,
@@ -187,18 +187,40 @@ class PermissionPolicy:
         )
 
 
+#: The only tool arguments echoed in an approval reason. File contents and edit
+#: text (``content``, ``old_text``, ``new_text``) are deliberately never shown.
+_DISPLAY_ARGUMENTS: tuple[str, ...] = ("command", "path")
+
+
+def _display_arguments(arguments: dict[str, Any]) -> str:
+    """Render approval-relevant arguments safely on one line.
+
+    ``ascii`` escapes control characters and every non-ASCII character, so
+    invisible characters, bidi overrides, and Unicode lookalikes remain visible
+    during approval and cannot forge prompt lines or inject terminal control
+    sequences.
+    """
+    return "; ".join(
+        f"{name}: {ascii(str(arguments[name]))}"
+        for name in _DISPLAY_ARGUMENTS
+        if name in arguments
+    )
+
+
 def build_permission_request(
     tool: ToolDefinition,
     call: ToolCall,
     decision: PermissionDecision,
     request_id: str,
 ) -> PermissionRequest:
+    reason = decision.reason or f"{tool.name} requires approval"
+    details = _display_arguments(call.arguments)
     return PermissionRequest(
         permission_request_id=request_id,
         tool_call_id=call.tool_call_id,
         tool_name=tool.name,
         permission_class=tool.permission,
-        reason=decision.reason or f"{tool.name} requires approval",
+        reason=f"{reason} [{details}]" if details else reason,
         risk=risk_for_permission_class(tool.permission),
     )
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from coding_agent.contracts import (
     PermissionClass,
     PermissionDecision,
@@ -118,6 +120,14 @@ def test_cli_approver_interactive_prompts() -> None:
     assert no.confirm(_request()) is False
 
 
+def _ask_request(name: str, arguments: dict) -> PermissionRequest:
+    definitions = _definitions()
+    call = ToolCall("c1", name, arguments)
+    decision = PermissionPolicy().check(definitions[name], call)
+    assert decision.decision is ASK
+    return build_permission_request(definitions[name], call, decision, "perm1")
+
+
 def test_build_permission_request_maps_risk() -> None:
     defs = _definitions()
     call = ToolCall("c1", "edit_file", {"path": "x", "old_text": "a", "new_text": "b"})
@@ -127,4 +137,113 @@ def test_build_permission_request_maps_risk() -> None:
     assert request.tool_name == "edit_file"
     assert request.permission_class is PermissionClass.WRITE
     assert request.risk is RiskLevel.MEDIUM
-    assert request.reason == "write needs approval"
+    assert request.reason == "write needs approval [path: 'x']"
+
+
+def test_permission_request_shows_shell_command() -> None:
+    request = _ask_request("shell", {"command": "pytest -q tests"})
+    assert "command: 'pytest -q tests'" in request.reason
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("edit_file", {"path": "src/app.py", "old_text": "a", "new_text": "b"}),
+        ("write_file", {"path": "src/new.py", "content": "new contents"}),
+        ("delete_file", {"path": "src/old.py"}),
+    ],
+)
+def test_permission_request_shows_target_path(name: str, arguments: dict) -> None:
+    request = _ask_request(name, arguments)
+    assert f"path: {arguments['path']!r}" in request.reason
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "secrets"),
+    [
+        (
+            "edit_file",
+            {"path": "src/app.py", "old_text": "OLD_SECRET", "new_text": "NEW_SECRET"},
+            ("OLD_SECRET", "NEW_SECRET"),
+        ),
+        (
+            "write_file",
+            {"path": "src/new.py", "content": "CONTENT_SECRET"},
+            ("CONTENT_SECRET",),
+        ),
+    ],
+)
+def test_permission_request_never_shows_file_contents(
+    name: str, arguments: dict, secrets: tuple[str, ...]
+) -> None:
+    request = _ask_request(name, arguments)
+    assert arguments["path"] in request.reason
+    for secret in secrets:
+        assert secret not in request.reason
+
+
+def test_permission_request_escapes_control_characters() -> None:
+    command = "npm test\x1b[31m\nrm -rf /tmp\x00\u202e"
+    reason = _ask_request("shell", {"command": command}).reason
+    assert "\x1b" not in reason
+    assert "\n" not in reason
+    assert "\x00" not in reason
+    assert "\u202e" not in reason
+    assert "\\x1b[31m" in reason
+    assert "\\n" in reason
+    assert "\\x00" in reason
+    assert "\\u202e" in reason
+
+
+@pytest.mark.parametrize(
+    ("character", "escape"),
+    [
+        ("\u034f", "\\u034f"),  # COMBINING GRAPHEME JOINER (zero-width)
+        ("\ufe0f", "\\ufe0f"),  # VARIATION SELECTOR-16 (invisible)
+        ("\u3164", "\\u3164"),  # HANGUL FILLER (blank)
+    ],
+)
+def test_invisible_unicode_is_escaped_in_request_and_prompt(
+    character: str, escape: str
+) -> None:
+    # These survive repr() raw, so approval must escape them explicitly to keep
+    # the displayed target from being visually disguised.
+    request = _ask_request("delete_file", {"path": f"important{character}.txt"})
+    assert character not in request.reason
+    assert escape in request.reason
+
+    out: list[str] = []
+    approver = CliApprover(input_fn=lambda p: "n", output_fn=out.append, is_tty_fn=lambda: True)
+    assert approver.confirm(request) is False
+    rendered = "\n".join(out)
+    assert character not in rendered
+    assert escape in rendered
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "expected"),
+    [
+        ("shell", {"command": "pytest -q tests"}, "pytest -q tests"),
+        (
+            "edit_file",
+            {"path": "src/app.py", "old_text": "OLD_SECRET", "new_text": "NEW_SECRET"},
+            "src/app.py",
+        ),
+        ("write_file", {"path": "notes.txt", "content": "CONTENT_SECRET"}, "notes.txt"),
+        ("delete_file", {"path": "old.txt"}, "old.txt"),
+    ],
+)
+def test_cli_approver_prompt_shows_action_without_contents(
+    name: str, arguments: dict, expected: str
+) -> None:
+    definitions = _definitions()
+    call = ToolCall("c1", name, arguments)
+    decision = PermissionPolicy().check(definitions[name], call)
+    request = build_permission_request(definitions[name], call, decision, "perm1")
+    out: list[str] = []
+    approver = CliApprover(input_fn=lambda p: "n", output_fn=out.append, is_tty_fn=lambda: True)
+    assert approver.confirm(request) is False
+    rendered = "\n".join(out)
+    assert expected in rendered
+    for secret in ("OLD_SECRET", "NEW_SECRET", "CONTENT_SECRET"):
+        assert secret not in rendered

@@ -8,6 +8,7 @@ from coding_agent.contracts import (
     PermissionDecisionValue,
     PermissionRequest,
     RiskLevel,
+    SideEffect,
     ToolCall,
     ToolDefinition,
 )
@@ -62,6 +63,18 @@ def test_write_file_is_ask() -> None:
     assert defs["write_file"].permission is PermissionClass.WRITE
     call = ToolCall("c1", "write_file", {"path": "x.txt", "content": "hi"})
     assert policy.check(defs["write_file"], call).decision is ASK
+
+
+def test_delete_file_is_ask() -> None:
+    # delete_file is a DESTRUCTIVE-class tool (D25 / §43) -> ASK via the policy
+    # class mapping, not a name hardcode (§13: capability-based decisions).
+    policy = PermissionPolicy()
+    defs = _definitions()
+    assert defs["delete_file"].permission is PermissionClass.DESTRUCTIVE
+    assert defs["delete_file"].side_effect is SideEffect.DESTRUCTIVE
+    decision = policy.check(defs["delete_file"], ToolCall("c1", "delete_file", {"path": "x"}))
+    assert decision.decision is ASK
+    assert decision.reason == "destructive operation requires approval"
 
 
 def test_shell_delegates_to_classifier() -> None:

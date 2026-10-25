@@ -417,3 +417,219 @@ neutrality, no-SDK-in-core rule, secret handling, timeout/`NETWORK_ERROR`,
 cost-quota/persistence all remain in force. Executor, permissions, workspace,
 verification, context, events, shell/`NETWORK`→DENY policy, and `ModelMessage` are
 unchanged. No new dependency.
+
+---
+
+## D23. Reserved SessionState permission/execution sub-states (v0.2)
+
+**Decision.** `EXECUTING_TOOL`, `WAITING_FOR_USER`, and `TOOL_DENIED` remain
+`SessionState` members (§31) and remain **non-terminal** (D4), but are
+reclassified as **reserved** conceptual sub-states of the `PERMISSION_CHECK`
+phase that the v0.2 runtime does **not** assign. Architecture §5 is amended so
+its diagram lists only runtime-assigned states — `PERMISSION_CHECK → TOOL_RESULT`
+per tool call, set immediately before and after `await executor.execute()` — and
+so the permission/execution outcome is documented as **observable** through the
+existing §40 `EventType`s (`PermissionRequested`, `PermissionGranted`,
+`PermissionDenied`, `ToolStarted`, `ToolCompleted`, `ToolFailed`) and
+**contractually represented** by `ToolResult.status` and `ToolResult.error.code`
+(a refusal is `status=DENIED` with `error.code=PERMISSION_DENIED`).
+`session.state` is documented as an observational progress marker written solely
+by the runtime, with no control-flow reader. The four terminal states,
+`TERMINAL_STATES`, §31 membership and values, the §40 vocabulary, every §29
+stable boundary, and the executor signature are unchanged. This is a
+**documentation-only** decision: no production code changes and no behavior
+changes.
+
+**Rationale.** Architecture §5 diagrammed
+`PERMISSION_CHECK → {EXECUTING_TOOL | WAITING_FOR_USER | TOOL_DENIED} →
+TOOL_RESULT`, but the runtime performs `PERMISSION_CHECK → TOOL_RESULT` around a
+single opaque `await`, so three of the fourteen declared states were unreachable
+and no test could observe them. Realizing them faithfully is not possible without
+moving a protected boundary: `Approver.confirm()` is synchronous and returns
+`bool` (§37, D7), so the runtime is suspended inside `await executor.execute()`
+for the entire permission-and-execution phase and cannot observe
+`WAITING_FOR_USER`; the executor must remain the only component authorized to
+execute tools and to decide permissions, and keeps receiving only `session_id`
+and `turn_id` (architecture §4.9, D6); and post-hoc inference cannot reconstruct
+the states in any case, because a returned `ToolResult` distinguishes `DENIED`
+from `SUCCESS`/`FAILURE`/`TIMEOUT` but cannot distinguish ALLOW-then-run from
+ASK-approved-then-run. The rest of the contract set already describes this phase
+without states — the normative tool loop (§27) specifies
+`check → DENY: append denied ToolResult, continue → ASK: Approver.confirm →
+execute → append ToolResult → emit events`; §37 requires that "All decisions emit
+events"; and §24/§34 use the "enters / transitions to `<STATE>`" idiom only for
+states the runtime actually assigns — leaving architecture §5 as the sole
+outlier. Amending the documents instead of adding machinery mirrors how D22
+removed the §4.6-vs-§4.9 ambiguity by clarifying the layer split, and follows
+architecture §9 ("do not create abstractions until they have a clear
+responsibility"; "avoid premature infrastructure … unless a demonstrated
+requirement justifies them"; "the runtime decides, the executor performs") and
+§30 ("only when a concrete requirement exists"). The members are **preserved
+rather than removed** because `State` is one of architecture §12's durable
+abstractions and architecture §9's future surfaces (Web UI, VS Code, API) may
+later want live progress, which the existing events already supply.
+
+**Consequences.** `docs/architecture.md` §5 and `docs/contracts.md` §31 are
+clarified as above; no other section changes, and §32's "`to_dict()` is the
+persistence seam" is left as written (no new persistence guarantee is created).
+Behavior is unchanged: `session.state` has no production control-flow reader, all
+readers are terminal-only (`_terminate`'s event selection, the CLI exit code and
+final stderr line) or serialization, `run()` always returns a terminal state
+because every return path funnels through the terminal transition, and no
+existing test asserts an intermediate state — so nothing breaks. A refusal still
+does not end the session: the runtime appends the `DENIED` result, counts it
+against `max_tool_calls`/`max_repeated_failures` (§34), and continues, preserving
+the behavioral intent of the former `TOOL_DENIED → TOOL_RESULT` edge. The
+invalid-transition sentence in architecture §5 is restated as the guarantees the
+runtime actually provides — sole writer, only the diagrammed states,
+always-terminal return — with invalid transitions prevented by construction
+rather than by a validator. **Out of scope:** async approval (an awaitable
+`Approver`), which is the prerequisite for ever realizing `WAITING_FOR_USER`;
+pause/resume; session persistence and any storage backend; new state-change
+events or a `state` field on non-terminal events; executor signature changes or
+passing `AgentSession` to the executor; a state-transition validator; unifying
+the duplicated terminality checks (`TERMINAL_STATES` versus the ad-hoc tuples in
+`runtime.py` and `cli.py`), noted here as an observation only; and the D21/D22
+deferrals — streaming, retries, provider routing/selection, cost/quota, context
+compaction — plus `delete_file` and the rest of §30. **D22 remains closed and
+unmodified:** its provider normalization, runtime structural backstop,
+`FAILED`-not-`PROVIDER_ERROR` classification, absence of a new `ErrorCode`, and
+the structural(runtime)/semantic(executor) split all stand, and the `FAILED`
+transition its backstop performs is retained in architecture §5's diagram. An
+optional test-only follow-up — pinning the reserved vocabulary (membership,
+identity `.value` strings, non-terminality) and the runtime-level
+refusal-continuation path — is **not** part of this decision and would be
+scheduled separately.
+
+---
+
+## D24. Mandatory `tool_calling` capability gate and §6 `write_file` correction (v0.2)
+
+**Decision.** The v0.2 agent loop requires exactly one model capability:
+**`tool_calling`**. `AgentRuntime.run()` checks the provider-neutral
+`ModelDescriptor.capabilities` returned by `describe()` **once per invocation,
+after the session enters `RUNNING` and `SESSION_STARTED` is emitted, and before
+the first `AgentTurn` is created or `generate()` is awaited**. If
+`capabilities.tool_calling` is `false`, the runtime rejects the task through the
+**existing failure path** — `_terminate(session, SessionState.FAILED, reason)` —
+with `completed_status` beginning `model capability unavailable` and naming
+`tool_calling`; the canonical string is `model capability unavailable:
+tool_calling is required for the agent loop`. No new `ErrorCode` is added, and
+the rejection is **not** a `ProviderError`: the `SESSION_FAILED` payload carries
+that reason and **no** `provider_error` key. `MODEL_UNAVAILABLE` (§25) is
+deliberately **not** reused — the provider answered `describe()` correctly and
+has not failed, so classifying a capability mismatch as a provider error would
+misattribute it. If `describe()` itself raises, that *is* a provider failure and
+is normalized through the existing §25 path (`normalize_provider_failure` →
+`FAILED` **with** `provider_error`), never escaping as a raw exception. The gate
+reads only the neutral descriptor: no provider id, model name, or
+vendor-specific branch, and no provider-level `capabilities()` method is
+reintroduced (D13). No other capability is gated — **`streaming` is explicitly
+not required** (§26, D9, D13), and `text`, `vision`, and `reasoning` are not
+gated in v0.2.
+
+Separately, as a documentation consistency correction, `write_file` is added to
+the workspace-guarantee file-tool list in architecture §6. This records what D20
+already specified and the implementation already enforces; it changes no
+workspace or tool semantics.
+
+**Rationale.** Contracts §5 states that "The runtime should reject a task
+requiring an unavailable capability rather than silently degrading behavior",
+but `capabilities` was written by both providers and asserted by descriptor
+tests while **no runtime, CLI, context, or executor code ever read it** — so a
+provider reporting `tool_calling: false` was accepted and the agent degraded
+into a plain chatbot, the exact outcome §5 forbids. This is the same defect
+class D22 closed for architecture §4.6 and D23 closed for architecture §5: a
+normative sentence with no enforcing code and no test. `tool_calling` is the
+right — and only — mandatory capability because the loop is tool-call driven
+(§22, §27) and `ContextBuilder` always sends tool definitions; `streaming`
+cannot be mandatory because the runtime never streams (§26 interface-only,
+D9/D13) and **both** shipped providers report `streaming: false`, so gating it
+would reject the offline default. The check point is the smallest seam
+consistent with the existing runtime: `run()` already owns session state and
+already calls `describe()` for §25 normalization, so the guard is a single
+pre-loop branch beside the existing limit checks, terminating through the same
+`_terminate(..., FAILED, reason)` path those checks use — no turn exists yet, so
+`_finish_turn` (D22) does not apply. Reusing that path rather than §25 keeps the
+classification honest and adds no vocabulary: a capability mismatch is a
+configuration/compatibility rejection, not a provider failure. Doing this in the
+runtime, not the CLI, is required by §5 ("The **runtime** should reject") and
+keeps it provider-neutral per architecture §4.3. The §6 correction is included
+because D20's consequences updated architecture §4.5 only, leaving §6's
+file-tool list implying that `write_file` is outside the workspace guarantee —
+contradicted by D20's own decision text and by two passing escape-rejection
+tests.
+
+**Consequences.** `AgentRuntime.run()` gains one provider-neutral pre-loop
+guard. `contracts.py` is **unchanged**: no new `ErrorCode`, no change to
+`ModelCapabilities`, `ModelDescriptor`, `SessionState`, `TERMINAL_STATES`,
+`EventType`, or any §29 stable boundary. `ModelProvider` keeps exactly
+`describe()`/`generate()`/`stream()` (D13); no provider implementation changes,
+and both shipped providers pass the gate unchanged. The executor, permissions,
+workspace, verification, context, events, tools, and shell policy are
+**unchanged** — the guard runs before any tool call exists, so D22's structural
+backstop and the structural(runtime)/semantic(executor) split are untouched,
+and D23's runtime-assigned state sequence gains no state and loses none. The
+CLI needs no change: `_exit_code` already maps every non-completed terminal
+state to `1`, so a capability rejection exits `1` and prints
+`[session <id>] FAILED: model capability unavailable: …`. Observable outcome on
+rejection: `session.state is SessionState.FAILED`; `completed_status` starts
+with `model capability unavailable` and names `tool_calling`; `SESSION_STARTED`
+then `SESSION_FAILED` are emitted with **no** `provider_error` key in the
+`SESSION_FAILED` payload; `session.history == []` and
+`session.tool_call_history == []`; `generate()` is never called. A `describe()`
+that raises still produces `FAILED` **with** a normalized `provider_error`, so
+§25's "provider failures must not escape" invariant holds. **This supersedes the
+D21 consequence "no change to ... the runtime" only to the extent necessary**
+for this guard; D21's provider neutrality, no-SDK-in-core rule, secret handling,
+finite timeout/`NETWORK_ERROR`, and `CancelledError` re-raise all remain in
+force. D22 remains closed and unmodified, and D23's reserved-state model and
+documentation-only outcome are unaffected. **Not implemented by D24:** the
+runtime guard itself and its tests (a separate implementation task); any
+capability negotiation, fallback, or downgrade; gating of `text`, `vision`,
+`reasoning`, or `streaming`; any requirement for the §5 future capabilities
+(`audio_input`, `audio_output`, `structured_output`, `parallel_tool_calls`,
+`computer_use`, `extended_context`); use of `ModelDescriptor.context_window`,
+`pricing`, or `limits`, which remain unconsumed; any retry of a rejected
+provider; any CLI flag to override the gate; and any change to
+`MockModelProvider`'s or `HttpModelProvider`'s descriptors. **Still deferred
+(§30, architecture §10, D21/D22/D23):** streaming, retries, provider
+routing/selection, cost/quota, persistence/resume, context compaction,
+`delete_file`, and every other §30 item. **Explicitly out of scope:** async
+approval, pause/resume, new state-change events, executor signature changes, a
+state-transition validator, and the terminality-check duplication noted as an
+observation in D23. No new dependency. The only other documentation change is
+the single-word §6 correction above; no further consistency edits are bundled.
+
+---
+
+## D25. delete_file adopted (v0.2)
+
+**Decision.** Adopt `delete_file` as a v0.2 tool: delete a single existing file
+at a workspace-contained path. Args `{path}` (required; `additionalProperties:
+false`); side effect `destructive`; permission `destructive` (→ ASK via the
+existing policy fallback "destructive operation requires approval"). Files
+only — directories are never deleted and recursive deletion is out of scope;
+nonexistent targets and directory targets return a structured
+`EXECUTION_FAILED`. An in-workspace symlink is removed as a link, never
+through to its target; `..`/symlink escapes return `PATH_OUTSIDE_WORKSPACE`
+(resolved before approval, re-validated after — §17 step 5). A successful
+delete counts as a **write** for D12 staleness (it invalidates a passing
+verification, exactly like `edit_file`/`write_file`); a failed or denied
+delete does not.
+
+**Rationale.** Deletion is the one missing whole-file filesystem capability;
+the readiness review confirmed every required mechanism already exists
+(workspace containment, D6 executor order, the pre-wired `DESTRUCTIVE`
+permission class, structured tool errors, D12 write tagging). Adoption is
+additive: one tool class, one registry entry, and one name added to the
+executor's write-tagging tuple — no new error codes, session states, event
+types, CLI changes, or provider changes.
+
+**Consequences.** Supersedes D18's deferral: `DeleteFileTool` moves from the
+contracts §30 deferred list to the authoritative contract §43. Architecture
+§4.5 gains the adoption sentence. The shell policy is unchanged (D5/D16):
+`rm` remains ASK and recursive-and-force `rm -rf` remains DENY — the tool
+coexists with the shell path. All other §30 items and the D21/D23 deferrals
+(streaming, retries, provider routing/selection, cost/quota, persistence/resume,
+context compaction) remain deferred.

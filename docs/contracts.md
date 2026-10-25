@@ -148,6 +148,13 @@ extended_context
 
 The runtime should reject a task requiring an unavailable capability rather than silently degrading behavior.
 
+v0.2 pins this concretely (D24): the agent loop requires `tool_calling`, so
+`AgentRuntime.run()` rejects a provider whose `describe().capabilities.tool_calling`
+is `false` before the first model turn, through the existing runtime failure path
+(`SessionState.FAILED`) — not as a §25 provider error. No other capability is
+gated in v0.2; in particular `streaming` is **not** required (§26, D9, D13), and
+both shipped providers report `streaming: false`.
+
 ---
 
 # 6. ModelRequest
@@ -1004,7 +1011,6 @@ Changing the meaning of an existing field requires an explicit architecture deci
 Future contracts may add:
 
 ```text
-DeleteFileTool
 MCPTool
 Subagent
 Skill
@@ -1044,6 +1050,16 @@ COMPLETED_UNVERIFIED
 INTERRUPTED
 FAILED
 ```
+
+Reserved members (D23): `WAITING_FOR_USER`, `TOOL_DENIED`, and `EXECUTING_TOOL`
+are declared vocabulary that the v0.2 runtime does **not** assign; they are
+conceptual sub-states of the `PERMISSION_CHECK` phase, and all three are
+**non-terminal**. The permission/execution outcome is observable through the §40
+`EventType`s (`PermissionRequested`, `PermissionGranted`, `PermissionDenied`,
+`ToolStarted`, `ToolCompleted`, `ToolFailed`) and is contractually represented by
+`ToolResult.status` and `ToolResult.error.code` — a refusal is `status=DENIED`
+with `error.code=PERMISSION_DENIED`, and per §27 it is appended as a result while
+the session continues (see architecture §5).
 
 Terminal states:
 
@@ -1107,7 +1123,18 @@ max_time_s              float   # default 600
 max_repeated_failures   int     # default 3
 ```
 
-Defaults: `max_turns=20`, `max_tool_calls=50`, `max_time_s=600`, `max_repeated_failures=3`. Exceeding a limit transitions the session to `INTERRUPTED` or `FAILED`.
+Defaults: `max_turns=20`, `max_tool_calls=50`, `max_time_s=600`, `max_repeated_failures=3`.
+
+Exceeding a limit transitions the session to a terminal state as follows:
+
+```text
+max_turns              → INTERRUPTED
+max_tool_calls         → INTERRUPTED
+max_time_s             → INTERRUPTED
+max_repeated_failures  → FAILED
+```
+
+The distinction is semantic: `INTERRUPTED` means execution was deliberately stopped because an operational execution bound (`max_turns`, `max_tool_calls`, `max_time_s`) was reached, whereas `FAILED` means the agent loop entered a failure condition. Hitting `max_repeated_failures` is a failure condition — the loop kept producing failed tool results — so it is `FAILED`, not `INTERRUPTED`. This is a clarification of existing behavior; it introduces no new state and changes no transition.
 
 ---
 
@@ -1258,3 +1285,101 @@ Behavior (adopted in v0.2; supersedes the §30 deferral of `WriteFileTool` — s
 * Permission class `write` → **ASK**; `--yes` auto-approves ASK only, never DENY (§37).
 * A successful `write_file` is a **write** for staleness (§27, §35, D12): it invalidates a passing verification exactly like `edit_file`.
 * Result output includes `path`, `created` (`true` when a new file was created, `false` when an existing file was replaced), and `bytes_written`.
+
+---
+
+# 42. CLI Output Contract
+
+The reference CLI delivers a finished session to the user through three normative
+channels. This section documents already-implemented, already test-pinned behavior
+(`cli.py`; CLI acceptance tests); it introduces no new state, event, flag, or
+`SessionState` member.
+
+```text
+stdout  the final answer only
+stderr  event telemetry + the terminal status line
+exit    process exit code derived from the terminal SessionState (§31)
+```
+
+Final answer (stdout):
+
+* After the run finishes, the CLI prints the **last** turn whose
+  `final_response` (§33) is not `None` — the session's final answer — to stdout.
+* Intermediate final responses (an earlier answer later superseded by a
+  corrective turn) are never printed; only the last one surfaces.
+* stdout carries no event telemetry, no status line, and no session identifiers.
+
+stderr:
+
+* Each `AgentEvent` (§40) emitted by the runtime is rendered to stderr as a
+  single human-readable line — the
+  "human-readable CLI output" role assigned to the event stream by architecture
+  §4.11.
+* A single terminal status line is then emitted, exactly:
+  `[session <session_id>] <STATE>: <completed_status>`
+  where `<STATE>` is the terminal `SessionState` value (§31) and
+  `<completed_status>` is the runtime-assigned `AgentSession.completed_status`
+  (§32).
+
+Exit codes (terminal `SessionState` §31 → process exit code):
+
+```text
+COMPLETED              → 0
+COMPLETED_UNVERIFIED   → 0
+INTERRUPTED            → 1
+FAILED                 → 1
+```
+
+`--quiet`:
+
+* `--quiet` suppresses **all** CLI output streams: the stdout final answer, the
+  stderr event telemetry, and the stderr terminal status line. The only
+  observable result is the process exit code.
+
+Relationship to verification (§35, D4):
+
+* `VerificationStarted` / `VerificationPassed` / `VerificationFailed` (§40) are
+  stderr **telemetry**, not user-facing results.
+* The verified/unverified outcome is reflected entirely by the existing terminal
+  status semantics (§31/§32): a session that wrote files and passed the
+  human-supplied `--verify` command terminates `COMPLETED` with
+  `completed_status` `"verified"`; a session that wrote but ran no verify
+  command terminates `COMPLETED_UNVERIFIED` with
+  `completed_status` `"completed (no verify command)"`. There is no
+  `COMPLETED_VERIFIED` state and none is introduced here.
+
+---
+
+# 43. delete_file
+
+ToolDefinition:
+
+```json
+{
+  "name": "delete_file",
+  "description": "Delete a file from the workspace.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string"
+      }
+    },
+    "required": ["path"],
+    "additionalProperties": false
+  },
+  "side_effect": "destructive",
+  "permission": "destructive"
+}
+```
+
+Behavior (adopted in v0.2; supersedes the §30 deferral of `DeleteFileTool` — see D25):
+
+* Files only: the target must be an existing file. Directories are never deleted (`EXECUTION_FAILED`), and recursive directory deletion is out of scope — this tool must not grow it.
+* A nonexistent target yields a structured `EXECUTION_FAILED`; the tool never raises a raw filesystem error.
+* The path must resolve within the workspace; `..` traversal or an absolute path outside → `PATH_OUTSIDE_WORKSPACE` (resolved before approval and re-validated after — §17 step 5). A symlink whose real target lies outside the workspace → `PATH_OUTSIDE_WORKSPACE`.
+* An in-workspace symlink is removed as a link — its target file is never deleted through it.
+* Permission class `destructive` → **ASK** ("destructive operation requires approval"); `--yes` auto-approves ASK only, never DENY (§37). A denied delete removes nothing and returns `PERMISSION_DENIED` (§18, `DENIED` status).
+* A successful `delete_file` is a **write** for staleness (§27, §35, D12): it invalidates a passing verification exactly like `edit_file`/`write_file`. A failed or denied delete is not a write.
+* Result output includes `path` (the workspace-relative path as requested).
+* The shell path is unchanged: `rm` still routes through the shell policy (D5/D16 — `rm` → ASK, recursive-and-force `rm -rf` → DENY). This tool coexists with it; §12's classification stays advisory metadata.

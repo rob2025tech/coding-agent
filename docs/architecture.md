@@ -170,6 +170,35 @@ in a URL, contract type, event, or `ProviderError`. Its HTTP traffic is the **mo
 transport** configured by the operator, not an agent network capability, so the
 shell `NETWORK`→DENY policy and arbitrary-shell DENY are unchanged.
 
+`HttpModelProvider` normalizes HTTP outcomes into the §25 vocabulary exactly as
+follows. §25 deliberately stays provider-neutral, so this provider-specific
+table lives here; the behavior is already implemented and test-pinned
+(`tests/test_http_provider.py`), and documenting it changes nothing:
+
+```text
+missing API key (local, no HTTP status)           → AUTHENTICATION_FAILED
+401, 403                                           → AUTHENTICATION_FAILED
+429                                                → RATE_LIMITED (retryable; retry_after_ms from Retry-After)
+413                                                → CONTEXT_TOO_LARGE
+400                                                → CONTEXT_TOO_LARGE if the body signals context overflow,
+                                                     else INVALID_REQUEST
+404                                                → MODEL_UNAVAILABLE if the body signals model-not-found,
+                                                     else PROVIDER_ERROR
+408                                                → NETWORK_ERROR
+any other status (incl. 5xx)                       → PROVIDER_ERROR (conservative fallback, D21)
+transport failure / timeout (OSError, URLError)    → NETWORK_ERROR (D21)
+2xx but malformed response body                    → PROVIDER_ERROR
+```
+
+`asyncio.CancelledError` is re-raised, never normalized (D21). The raw status is
+always preserved in `ProviderError.metadata["http_status"]`; error messages never
+echo the raw response body or any authorization data.
+
+Diagnostic caveat: a 403 from an upstream gateway (WAF bot filtering, plan or
+feature refusal, IP policy) is indistinguishable from an authentication failure
+at this layer and normalizes to `AUTHENTICATION_FAILED` even when the API key is
+valid — diagnose from `metadata["http_status"]`, not from the code alone.
+
 The runtime should not contain provider-specific business logic.
 
 ---
@@ -219,7 +248,7 @@ browser
 database
 ```
 
-`write_file` was adopted in v0.2 (see `docs/decisions.md` D20 and `docs/contracts.md` §41): it atomically creates a new UTF-8 file or replaces an existing one, and does not create missing parent directories. `edit_file` modifies an existing file only; it does not create files (see `docs/contracts.md` §38).
+`write_file` was adopted in v0.2 (see `docs/decisions.md` D20 and `docs/contracts.md` §41): it atomically creates a new UTF-8 file or replaces an existing one, and does not create missing parent directories. `edit_file` modifies an existing file only; it does not create files (see `docs/contracts.md` §38). `delete_file` was adopted in v0.2 (see `docs/decisions.md` D25 and `docs/contracts.md` §43): it deletes a single existing file — directories are never deleted and recursive deletion is out of scope.
 
 Every tool must have:
 
@@ -472,7 +501,7 @@ The event stream should support:
 
 ## 5. Agent State Machine
 
-The initial state machine is:
+The v0.2 runtime-assigned state machine is:
 
 ```text
 CREATED
@@ -484,15 +513,6 @@ MODEL_THINKING
 TOOL_REQUESTED
   ↓
 PERMISSION_CHECK
-  ├── ALLOW → EXECUTING_TOOL
-  ├── ASK   → WAITING_FOR_USER
-  └── DENY  → TOOL_DENIED
-                  ↓
-             TOOL_RESULT
-                  ↓
-             MODEL_THINKING
-
-EXECUTING_TOOL
   ↓
 TOOL_RESULT
   ↓
@@ -519,7 +539,51 @@ In `VERIFICATION_CHECK`, a **write** means a successful `edit_file` or any
 non-allowlisted `shell` execution (see §4.10); either invalidates a prior passing
 verification.
 
-The implementation should prevent invalid state transitions.
+### Runtime-assigned states and reserved sub-states (D23)
+
+The diagram above lists every state the v0.2 runtime assigns. `EXECUTING_TOOL`,
+`WAITING_FOR_USER`, and `TOOL_DENIED` remain `SessionState` members (contracts
+§31) and remain **non-terminal** (D4), but the runtime **does not assign them**;
+they are reserved conceptual sub-states of the `PERMISSION_CHECK` phase.
+
+The runtime sets `PERMISSION_CHECK` once per tool call immediately before
+awaiting `ToolExecutor.execute()`, and `TOOL_RESULT` immediately after it returns
+— whether the call was allowed, approved, or refused. The permission/execution
+outcome is observable through the existing contracts §40 `EventType`s
+(`PermissionRequested`, `PermissionGranted`, `PermissionDenied`, `ToolStarted`,
+`ToolCompleted`, `ToolFailed`) and is contractually represented by
+`ToolResult.status` and `ToolResult.error.code`: a refusal is `status=DENIED`
+with `error.code=PERMISSION_DENIED`. This matches the normative tool loop in
+contracts §27, which describes that phase without naming any state, and contracts
+§37, which requires that "All decisions emit events".
+
+A refusal does not end the session: the runtime appends the denied result, counts
+it against `max_tool_calls` / `max_repeated_failures` (contracts §34), and
+continues — preserving the behavioral intent of the former
+`TOOL_DENIED → TOOL_RESULT` edge.
+
+**Boundary (unchanged).** The runtime remains the sole writer of `session.state`
+and the sole owner of `AgentSession`. The executor remains the only component
+authorized to execute tools and to perform the permission check and approval
+(§4.9, D6), and `ToolExecutor.execute()` continues to receive only `session_id`
+and `turn_id` — never the session.
+
+`WAITING_FOR_USER` cannot be observed by the runtime as things stand:
+`Approver.confirm()` is synchronous and returns `bool` (contracts §37, D7), so
+the runtime is suspended inside `await executor.execute()` for the whole
+permission-and-execution phase. Realizing these three states would require a
+future **async approval seam** (an awaitable `Approver`), which is out of scope
+(D23), as are pause/resume, session persistence, new state-change events,
+executor signature changes, and a state-transition validator.
+
+**Runtime guarantees.** The runtime is the sole writer of `session.state`; it
+assigns only the states in the diagram above; `session.state` has no control-flow
+reader (the loop is driven by limits, the write tracker, and provider responses);
+and every return from `AgentRuntime.run()` passes through the terminal
+transition, so the final state is always one of the four terminal states. Invalid
+transitions are prevented by construction — the runtime never assigns a state
+outside this sequence — rather than by a validator; none exists and none is
+required in v0.2.
 
 ---
 
@@ -540,7 +604,7 @@ Path traversal and unsafe filesystem access must be validated before execution.
 
 The initial implementation should prefer explicit workspace boundaries over unrestricted host access.
 
-The workspace guarantee applies to **file tools** (`list_files`, `read_file`, `edit_file`, `search`). The `shell` tool is **not** contained by the workspace: it is gated by human approval (see §4.8), and pinning `cwd` to the repository root does not prevent a command from referencing absolute or `../` paths.
+The workspace guarantee applies to **file tools** (`list_files`, `read_file`, `edit_file`, `write_file`, `search`). The `shell` tool is **not** contained by the workspace: it is gated by human approval (see §4.8), and pinning `cwd` to the repository root does not prevent a command from referencing absolute or `../` paths.
 
 ---
 

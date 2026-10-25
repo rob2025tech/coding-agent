@@ -10,6 +10,7 @@ import pytest
 from coding_agent.context import ContextBuilder
 from coding_agent.contracts import (
     AgentSession,
+    ErrorCode,
     Limits,
     ModelCapabilities,
     ModelDescriptor,
@@ -27,7 +28,7 @@ from coding_agent.contracts import (
 from coding_agent.errors import ProviderExecutionError
 from coding_agent.events import EventSink, EventType, ListEventSink
 from coding_agent.executor import ToolExecutor
-from coding_agent.permissions import Approver, AutoApprover, PermissionPolicy
+from coding_agent.permissions import Approver, AutoApprover, DenyAllApprover, PermissionPolicy
 from coding_agent.providers.base import ModelProvider
 from coding_agent.providers.mock import (
     MockModelProvider,
@@ -116,6 +117,13 @@ async def test_happy_path_verified(workspace: Workspace, pycmd) -> None:
     assert len(final.verification_history) == 1
     assert final.verification_history[0].passed is True
     types = sink.types()
+    # EVT (§40): the model-call and verification boundaries are part of the documented
+    # event surface — pin emission and ordering (no fixed full-sequence coupling).
+    assert EventType.MODEL_REQUESTED in types
+    assert EventType.MODEL_RESPONDED in types
+    assert types.index(EventType.MODEL_REQUESTED) < types.index(EventType.MODEL_RESPONDED)
+    assert EventType.VERIFICATION_STARTED in types
+    assert types.index(EventType.VERIFICATION_STARTED) < types.index(EventType.VERIFICATION_PASSED)
     assert EventType.VERIFICATION_PASSED in types
     assert EventType.SESSION_COMPLETED in types
 
@@ -151,6 +159,9 @@ async def test_failure_path_then_verified(workspace: Workspace, pycmd) -> None:
     assert [v.passed for v in final.verification_history] == [False, True]
     assert tracker.dirty is False
     types = sink.types()
+    # EVT (§40): VERIFICATION_STARTED precedes the completion event of the same run.
+    assert EventType.VERIFICATION_STARTED in types
+    assert types.index(EventType.VERIFICATION_STARTED) < types.index(EventType.VERIFICATION_FAILED)
     assert EventType.VERIFICATION_FAILED in types
     assert EventType.VERIFICATION_PASSED in types
 
@@ -239,6 +250,29 @@ async def test_write_file_triggers_runtime_verification(workspace: Workspace, py
     provider = MockModelProvider(
         [
             tool_call_response("write_file", {"path": "new.txt", "content": "hi"}),
+            final_response("done"),
+        ]
+    )
+    runtime, session, sink, tracker = _build(workspace, provider, verify=verify)
+    final = await runtime.run(session)
+    assert tracker.ever_wrote is True
+    assert tracker.dirty is False  # the pass cleared staleness (D12)
+    assert final.state is SessionState.COMPLETED
+    assert final.completed_status == "verified"
+    assert len(final.verification_history) == 1
+    assert final.verification_history[0].passed is True
+    assert EventType.VERIFICATION_PASSED in sink.types()
+
+
+async def test_delete_file_triggers_runtime_verification(workspace: Workspace, pycmd) -> None:
+    # A successful delete_file is a D12 write (D25 / §43): the runtime runs the
+    # configured verification on the completion signal and records the result.
+    verify = pycmd(
+        "import pathlib,sys; sys.exit(0 if not pathlib.Path('hello.py').exists() else 1)"
+    )
+    provider = MockModelProvider(
+        [
+            tool_call_response("delete_file", {"path": "hello.py"}),
             final_response("done"),
         ]
     )
@@ -509,3 +543,275 @@ async def test_valid_tool_call_reaches_executor(workspace: Workspace) -> None:
     assert spy.calls[0].name == "read_file"
     assert EventType.TOOL_REQUESTED in sink.types()
     assert final.state is SessionState.COMPLETED
+
+
+async def test_valid_tool_call_with_empty_arguments_reaches_executor(
+    workspace: Workspace,
+) -> None:
+    # D22 (audit F-1): arguments={} is structurally valid (S3, contracts §14), so it
+    # must pass the runtime backstop into the executor, preserving the normal flow.
+    provider = MockModelProvider(
+        [tool_call_response("read_file", {}), final_response("done")]
+    )
+    spy = _spy(workspace)
+    runtime, session, sink, _t = _build(workspace, provider, executor=spy)
+    final = await runtime.run(session)
+    assert len(spy.calls) == 1  # the executor was reached
+    assert spy.calls[0].tool_call_id  # non-empty string tool_call_id
+    assert spy.calls[0].name == "read_file"  # non-empty string name
+    assert spy.calls[0].arguments == {}  # {} passed through untouched
+    assert EventType.TOOL_REQUESTED in sink.types()  # the backstop did not fire
+    assert final.state is SessionState.COMPLETED  # existing success behavior
+
+
+# --- D24 capability gate: `tool_calling` is the only mandatory capability --- #
+
+
+class _CapabilityProvider(ModelProvider):
+    """A minimal provider advertising a chosen ``ModelCapabilities``.
+
+    D24 requires the runtime to gate on the neutral ``ModelDescriptor.capabilities``
+    rather than on provider identity, so an arbitrary ``provider_id``/``model_id``
+    shows the check is descriptor-driven. ``generate`` records each request so a
+    test can assert it was never awaited, and ``describe`` counts calls so a test
+    can pin D24's once-per-``run()`` guarantee.
+    """
+
+    def __init__(
+        self,
+        capabilities: ModelCapabilities,
+        *,
+        responses: list[ModelResponse] | None = None,
+        provider_id: str = "fake",
+        model_id: str = "fake-m1",
+    ) -> None:
+        self._capabilities = capabilities
+        self._provider_id = provider_id
+        self._model_id = model_id
+        self._script: list[ModelResponse] = list(responses or [])
+        self.requests: list[ModelRequest] = []
+        self.describe_calls = 0
+
+    def describe(self) -> ModelDescriptor:
+        self.describe_calls += 1
+        return ModelDescriptor(
+            provider_id=self._provider_id,
+            model_id=self._model_id,
+            capabilities=self._capabilities,
+            context_window=1000,
+        )
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        if self._script:
+            return self._script.pop(0)
+        return final_response("done")
+
+
+_TOOL_CAPABLE = ModelCapabilities(
+    text=True, tool_calling=True, streaming=False, vision=False, reasoning=False
+)
+_NO_TOOL_CALLING = ModelCapabilities(
+    text=True, tool_calling=False, streaming=False, vision=False, reasoning=False
+)
+_CAPABILITY_REASON = "model capability unavailable: tool_calling is required for the agent loop"
+
+
+async def test_tool_calling_capability_allows_normal_execution(workspace: Workspace) -> None:
+    # A: with the mandatory capability present the ordinary loop still runs end to
+    # end. Both shipped providers report tool_calling=True, so this is a no-op for
+    # them; the gate must not disturb normal execution.
+    provider = _CapabilityProvider(
+        _TOOL_CAPABLE,
+        responses=[
+            tool_call_response("read_file", {"path": "hello.py"}),
+            final_response("done"),
+        ],
+    )
+    spy = _spy(workspace)
+    runtime, session, sink, _t = _build(workspace, provider, executor=spy)
+    # _build() reads the descriptor to construct the ModelRef; reset so the count
+    # below measures AgentRuntime.run() alone.
+    provider.describe_calls = 0
+    final = await runtime.run(session)
+    assert final.state is SessionState.COMPLETED
+    assert len(provider.requests) == 2  # generate() was awaited as usual
+    # Audit G-1: the gate consults describe() exactly once per run(), not once per
+    # turn — this session spans two model turns, so a per-turn check would see 2.
+    assert provider.describe_calls == 1
+    assert len(spy.calls) == 1  # the executor was reached
+    assert EventType.TOOL_REQUESTED in sink.types()
+    assert EventType.SESSION_COMPLETED in sink.types()
+
+
+async def test_missing_tool_calling_capability_fails_session(workspace: Workspace) -> None:
+    # B: tool_calling=False is rejected before the first model turn (D24).
+    provider = _CapabilityProvider(_NO_TOOL_CALLING)
+    spy = _spy(workspace)
+    runtime, session, sink, _t = _build(workspace, provider, executor=spy)
+    final = await runtime.run(session)
+
+    assert final.state is SessionState.FAILED
+    assert final.completed_status == _CAPABILITY_REASON
+    # Started, then failed: no model turn, no tool turn, no verification.
+    assert sink.types() == [EventType.SESSION_STARTED, EventType.SESSION_FAILED]
+    assert final.history == []  # no AgentTurn was created
+    assert final.tool_call_history == []
+    assert provider.requests == []  # generate() was never awaited
+    assert spy.calls == []  # the executor was never invoked
+    # Not a provider failure (§25): no provider_error, and not MODEL_UNAVAILABLE.
+    payload = sink.of_type(EventType.SESSION_FAILED)[0].payload
+    assert "provider_error" not in payload
+    assert payload["state"] == SessionState.FAILED.value
+    assert payload["reason"] == _CAPABILITY_REASON
+    assert "provider error:" not in (final.completed_status or "")
+    assert "MODEL_UNAVAILABLE" not in (final.completed_status or "")
+
+
+@pytest.mark.parametrize("provider_id", ["fake-provider", "another-vendor"])
+async def test_capability_gate_is_descriptor_driven_not_provider_specific(
+    workspace: Workspace, provider_id: str
+) -> None:
+    # E: identical descriptors are rejected identically whatever the provider
+    # identity, and the diagnostic names the capability, never the provider.
+    provider = _CapabilityProvider(_NO_TOOL_CALLING, provider_id=provider_id, model_id="m-9")
+    runtime, session, _sink, _t = _build(workspace, provider)
+    final = await runtime.run(session)
+    assert final.state is SessionState.FAILED
+    assert final.completed_status == _CAPABILITY_REASON
+    assert provider_id not in (final.completed_status or "")
+    assert "m-9" not in (final.completed_status or "")
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        ModelCapabilities(text=True, tool_calling=True, streaming=False),
+        ModelCapabilities(text=True, tool_calling=True, streaming=True),
+        ModelCapabilities(
+            text=True, tool_calling=True, streaming=False, vision=True, reasoning=True
+        ),
+    ],
+)
+async def test_only_tool_calling_is_gated(
+    workspace: Workspace, capabilities: ModelCapabilities
+) -> None:
+    # C: D24 gates `tool_calling` alone. `streaming` is explicitly not required —
+    # both shipped providers report streaming=False — nor are vision/reasoning.
+    provider = _CapabilityProvider(capabilities)
+    runtime, session, sink, _t = _build(workspace, provider)
+    final = await runtime.run(session)
+    assert final.state is SessionState.COMPLETED
+    assert "model capability unavailable" not in (final.completed_status or "")
+    assert EventType.SESSION_FAILED not in sink.types()
+    assert len(provider.requests) == 1
+
+
+async def test_describe_failure_still_normalizes_as_provider_error(workspace: Workspace) -> None:
+    # D: describe() raising is a genuine provider failure (§25) and keeps the
+    # existing normalization path; it must not be read as a capability mismatch.
+    class _DescribeRaiser(ModelProvider):
+        def describe(self) -> ModelDescriptor:
+            raise RuntimeError("describe boom")
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            return final_response("done")  # unreachable: the gate fails first
+
+    spy = _spy(workspace)
+    sink = ListEventSink()
+    # _build() calls describe() itself, so construct the runtime directly here.
+    runtime = AgentRuntime(
+        provider=_DescribeRaiser(),
+        registry=default_registry(),
+        executor=spy,
+        context_builder=ContextBuilder(ModelRef(provider_id="raiser", model_id="r1")),
+        verifier=Verifier(None, repo_root=workspace.repo_root),
+        event_sink=sink,
+    )
+    session = AgentSession(
+        session_id="s-test",
+        request="complete the task",
+        repo_root=workspace.repo_root,
+        working_dir=workspace.repo_root,
+    )
+    final = await runtime.run(session)  # must return, not raise
+    assert final.state is SessionState.FAILED
+    assert sink.types() == [EventType.SESSION_STARTED, EventType.SESSION_FAILED]
+    assert (final.completed_status or "").startswith("provider error: PROVIDER_ERROR")
+    payload = sink.of_type(EventType.SESSION_FAILED)[0].payload
+    assert payload["provider_error"]["code"] == "PROVIDER_ERROR"
+    assert payload["provider_error"]["metadata"]["exception_type"] == "RuntimeError"
+    assert "model capability unavailable" not in (final.completed_status or "")
+    assert spy.calls == []
+    assert final.history == []
+
+
+# --- D23 follow-up: runtime-level DENIED refusal continuation (§27, §31, §34) --- #
+
+
+async def test_denied_refusal_is_appended_and_session_continues(workspace: Workspace) -> None:
+    # D23 / §27 / §34: a refusal is appended as a DENIED ToolResult and the loop
+    # continues to the model instead of ending the session. DenyAllApprover turns the
+    # edit_file ASK into a denial, so no write occurs and the next turn can complete.
+    provider = MockModelProvider(
+        [
+            tool_call_response(
+                "edit_file",
+                {"path": "hello.py", "old_text": "print('Hello')", "new_text": "print('Hi')"},
+            ),
+            final_response("done"),
+        ]
+    )
+    runtime, session, sink, tracker = _build(
+        workspace, provider, verify=None, approver=DenyAllApprover()
+    )
+    final = await runtime.run(session)
+
+    # The refusal did not terminate the session: the model was reached again and the
+    # session then completed normally.
+    assert final.state is SessionState.COMPLETED
+    assert provider.call_count == 2  # the refused turn, then the final-answer turn
+
+    # The DENIED result was appended to its turn and the call to the session history.
+    assert len(final.history) == 2  # the refused tool turn + the final-answer turn
+    denied = final.history[0].tool_results[0]
+    assert denied.status is ToolResultStatus.DENIED
+    assert denied.error is not None
+    assert denied.error.code is ErrorCode.PERMISSION_DENIED
+    assert len(final.tool_call_history) == 1
+    assert final.tool_call_history[0].name == "edit_file"
+
+    # The edit was refused, so nothing was written and nothing is stale.
+    assert tracker.ever_wrote is False
+
+    types = sink.types()
+    assert EventType.PERMISSION_DENIED in types
+    assert EventType.SESSION_COMPLETED in types
+
+
+async def test_repeated_denied_refusals_trip_max_repeated_failures(workspace: Workspace) -> None:
+    # D23 / §34: a refusal counts against max_repeated_failures, so repeated denials
+    # drive the session to FAILED through the existing limit (implementation unchanged).
+    edits = [
+        tool_call_response(
+            "edit_file",
+            {"path": "hello.py", "old_text": "print('Hello')", "new_text": "print('Hi')"},
+        )
+        for _ in range(3)
+    ]
+    provider = MockModelProvider(edits)
+    runtime, session, sink, _t = _build(
+        workspace,
+        provider,
+        limits=Limits(max_repeated_failures=2),
+        approver=DenyAllApprover(),
+    )
+    final = await runtime.run(session)
+
+    assert final.state is SessionState.FAILED
+    assert final.completed_status == "max_repeated_failures exceeded"
+    assert EventType.SESSION_FAILED in sink.types()
+    # Every recorded tool result was a DENIED refusal, not an execution failure.
+    results = [r for turn in final.history for r in turn.tool_results]
+    assert results
+    assert all(r.status is ToolResultStatus.DENIED for r in results)

@@ -2,7 +2,8 @@
 
 Orchestrates: build context -> model generate -> tool calls (via the executor) ->
 final answer -> runtime-owned VERIFICATION_CHECK -> terminal state. Enforces the
-finalized limits (D15) and the D12 write/staleness rule.
+finalized limits (D15), the D12 write/staleness rule, and the D24 mandatory
+tool_calling capability gate.
 
 Limit -> terminal-state mapping (an implementation choice within §34's
 "INTERRUPTED or FAILED"): turns / tool-calls / wall-time -> INTERRUPTED;
@@ -58,6 +59,29 @@ class AgentRuntime:
         limits = session.limits
         session.state = SessionState.RUNNING
         self._emit(session, EventType.SESSION_STARTED, None, request=session.request)
+
+        # --- capability gate (D24, contracts §5): once per run, before any turn ---
+        # The loop is tool-call driven, so `tool_calling` is the only mandatory
+        # capability. A false value is *not* a provider failure (§25) — describe()
+        # answered correctly — so terminate via the existing failure path.
+        try:
+            capabilities = self._provider.describe().capabilities
+        except Exception as exc:  # describe() failing *is* a provider failure (§25)
+            provider_error = normalize_provider_failure(
+                exc, provider_id=self._provider_id()
+            )
+            return self._terminate(
+                session,
+                SessionState.FAILED,
+                f"provider error: {provider_error.code.value}: {provider_error.message}",
+                provider_error=provider_error,
+            )
+        if not capabilities.tool_calling:
+            return self._terminate(
+                session,
+                SessionState.FAILED,
+                "model capability unavailable: tool_calling is required for the agent loop",
+            )
 
         started = time.monotonic()
         turn_index = 0

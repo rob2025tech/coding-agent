@@ -20,6 +20,7 @@ from coding_agent.contracts import (
     ToolCall,
     ToolResult,
     ToolResultStatus,
+    Usage,
 )
 
 
@@ -42,6 +43,21 @@ def test_terminal_states() -> None:
     )
     # TOOL_DENIED is explicitly *not* terminal (contracts §31).
     assert SessionState.TOOL_DENIED not in TERMINAL_STATES
+
+
+def test_d23_reserved_states_are_nonterminal_vocabulary() -> None:
+    # D23 reserves EXECUTING_TOOL, WAITING_FOR_USER, and TOOL_DENIED as conceptual
+    # sub-states of the PERMISSION_CHECK phase that the v0.2 runtime never assigns.
+    # Pin their membership, exact .value identity strings, and non-terminality (§31).
+    reserved = {
+        SessionState.EXECUTING_TOOL: "EXECUTING_TOOL",
+        SessionState.WAITING_FOR_USER: "WAITING_FOR_USER",
+        SessionState.TOOL_DENIED: "TOOL_DENIED",
+    }
+    for state, value in reserved.items():
+        assert state in SessionState  # member exists
+        assert state.value == value  # exact identity string
+        assert state not in TERMINAL_STATES  # non-terminal (contracts §31, D4)
 
 
 def test_string_enums_serialize_by_value() -> None:
@@ -112,6 +128,33 @@ def test_turn_to_dict_includes_model_request_and_response() -> None:
     assert d["model_response"]["stop_reason"] == "completed"
     assert d["model_response"]["content"] == [{"type": "text", "text": "hi"}]
     json.dumps(d)  # must not raise
+
+
+def test_turn_to_dict_preserves_model_usage() -> None:
+    # §24: the runtime should preserve usage when available. Pin both serialization
+    # layers — ModelResponse.to_dict() and the AgentTurn that embeds it — plus the
+    # usage-is-None branch. No production change; this only exercises existing code.
+    expected = {"input_tokens": 1200, "output_tokens": 450, "cached_input_tokens": 7}
+    response = ModelResponse(
+        response_id="r1",
+        stop_reason=StopReason.COMPLETED,
+        content=[MessageContent.text_block("hi")],
+        usage=Usage(**expected),
+    )
+    # Positive branch 1: the populated usage serializes through ModelResponse.to_dict().
+    assert response.to_dict()["usage"] == expected
+    # Positive branch 2: it survives the second layer via AgentTurn.to_dict().
+    turn = AgentTurn(
+        turn_id="t1",
+        session_id="s1",
+        index=0,
+        started_at=dt.datetime(2026, 1, 1),
+        model_response=response,
+    )
+    assert turn.to_dict()["model_response"]["usage"] == expected
+    json.dumps(turn.to_dict())  # must not raise
+    # Negative branch: a response without usage serializes "usage": None.
+    assert _sample_response().to_dict()["usage"] is None
 
 
 def test_turn_to_dict_model_fields_present_when_unset() -> None:

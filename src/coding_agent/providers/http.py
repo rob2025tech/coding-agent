@@ -195,6 +195,7 @@ class HttpModelProvider(ModelProvider):
             "accept": "application/json",
             # The secret lives ONLY in this header — never in the URL or the body.
             "authorization": f"Bearer {api_key}",
+            "user-agent": "coding-agent",
         }
         payload = self._build_payload(request)
         return HttpRequest(

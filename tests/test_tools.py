@@ -64,6 +64,59 @@ async def test_search_invalid_regex(invoke_tool: Invoke) -> None:
     assert result.error.code is ErrorCode.INVALID_ARGUMENTS
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+async def test_search_skips_symlink_escaping_workspace(
+    invoke_tool: Invoke, repo: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("OUTSIDE_SECRET_MARKER\n", encoding="utf-8")
+    os.symlink(str(outside), str(repo / "leak.txt"))
+
+    result = await invoke_tool(SearchTool(), {"pattern": "OUTSIDE_SECRET_MARKER"})
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.output["matches"] == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+async def test_search_skips_symlink_chain_escaping_workspace(
+    invoke_tool: Invoke, repo: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("CHAIN_SECRET_MARKER\n", encoding="utf-8")
+    os.symlink(str(outside), str(repo / "first_link.txt"))
+    os.symlink(str(repo / "first_link.txt"), str(repo / "second_link.txt"))
+
+    result = await invoke_tool(SearchTool(), {"pattern": "CHAIN_SECRET_MARKER"})
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.output["matches"] == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+async def test_search_reads_symlink_to_file_inside_workspace(
+    invoke_tool: Invoke, repo: Path
+) -> None:
+    os.symlink(str(repo / "data" / "a.txt"), str(repo / "alias.txt"))
+
+    result = await invoke_tool(SearchTool(), {"pattern": "alpha"})
+    assert result.status is ToolResultStatus.SUCCESS
+    paths = {match["path"] for match in result.output["matches"]}
+    assert "alias.txt" in paths
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+async def test_search_does_not_follow_symlinked_directory_outside_workspace(
+    invoke_tool: Invoke, repo: Path, tmp_path: Path
+) -> None:
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "secret.txt").write_text("DIR_SECRET_MARKER\n", encoding="utf-8")
+    os.symlink(str(outside_dir), str(repo / "outside_dir_link"))
+
+    result = await invoke_tool(SearchTool(), {"pattern": "DIR_SECRET_MARKER"})
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.output["matches"] == []
+
+
 # --- edit_file (D3 / §38) --- #
 
 

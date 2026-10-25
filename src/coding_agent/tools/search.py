@@ -64,6 +64,16 @@ class SearchTool(Tool):
                 if name.startswith("."):
                     continue
                 full = os.path.join(dirpath, name)
+                # ``os.walk`` yields symlinked files, and opening one follows its
+                # target. Re-check containment per discovered file so ``search``
+                # cannot read outside repo_root even though the search root itself
+                # was already resolved by the executor.
+                try:
+                    within_workspace = invocation.workspace.contains(full)
+                except (OSError, ValueError):
+                    within_workspace = False
+                if not within_workspace:
+                    continue
                 try:
                     with open(full, "rb") as handle:
                         data = handle.read()

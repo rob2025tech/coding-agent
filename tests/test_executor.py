@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -17,6 +20,7 @@ from coding_agent.contracts import (
 )
 from coding_agent.events import EventType, ListEventSink
 from coding_agent.executor import ToolExecutor
+from proc_helpers import kill_pid, pid_writer_code, wait_dead, wait_for_pids
 
 SESSION = "s1"
 
@@ -198,6 +202,104 @@ async def test_tool_timeout(make_executor: Callable[..., ToolExecutor], sleep_cm
     assert result.error is not None
     assert result.error.code is ErrorCode.TIMEOUT
     assert EventType.TOOL_FAILED in sink.types()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_tool_timeout_kills_direct_child(
+    make_executor: Callable[..., ToolExecutor],
+    repo: Path,
+    pycmd: Callable[[str], str],
+) -> None:
+    sink = ListEventSink()
+    executor = make_executor(approver=RecordingApprover(True), sink=sink, timeout_ms=1000)
+    pid_file = repo / "executor-timeout.pid"
+    result = await executor.execute(
+        ToolCall("c1", "shell", {"command": pycmd(pid_writer_code(pid_file))}),
+        session_id=SESSION,
+    )
+    pids: list[int] = []
+    try:
+        pids = await wait_for_pids(pid_file)
+        assert result.status is ToolResultStatus.TIMEOUT
+        assert result.error is not None
+        assert result.error.code is ErrorCode.TIMEOUT
+        assert EventType.TOOL_FAILED in sink.types()
+        assert await wait_dead(pids[0])
+    finally:
+        for pid in pids:
+            kill_pid(pid)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_tool_cancellation_kills_direct_child(
+    make_executor: Callable[..., ToolExecutor],
+    repo: Path,
+    pycmd: Callable[[str], str],
+) -> None:
+    executor = make_executor(approver=RecordingApprover(True), timeout_ms=30_000)
+    pid_file = repo / "executor-cancel.pid"
+    task = asyncio.create_task(
+        executor.execute(
+            ToolCall("c1", "shell", {"command": pycmd(pid_writer_code(pid_file))}),
+            session_id=SESSION,
+        )
+    )
+    pids: list[int] = []
+    try:
+        pids = await wait_for_pids(pid_file)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await wait_dead(pids[0])
+    finally:
+        if not task.done():
+            task.cancel()
+        for pid in pids:
+            kill_pid(pid)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_unexpected_tool_exception_cleans_child_and_returns_internal_error(
+    make_executor: Callable[..., ToolExecutor],
+    repo: Path,
+    pycmd: Callable[[str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = ListEventSink()
+    executor = make_executor(approver=RecordingApprover(True), sink=sink, timeout_ms=30_000)
+    pid_file = repo / "executor-error.pid"
+    real_wait_for = asyncio.wait_for
+    calls = 0
+
+    async def _fake(aw: Any, timeout: float) -> Any:
+        # Call 1 is the executor's outer timeout; call 2 is the shell's
+        # communicate wait, which fails after the child records its pid.
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            deadline = time.monotonic() + 2.0
+            while not pid_file.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            aw.close()
+            raise RuntimeError("shell boom")
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", _fake)
+    pids: list[int] = []
+    try:
+        result = await executor.execute(
+            ToolCall("c1", "shell", {"command": pycmd(pid_writer_code(pid_file))}),
+            session_id=SESSION,
+        )
+        pids = await wait_for_pids(pid_file)
+        assert result.status is ToolResultStatus.FAILURE
+        assert result.error is not None
+        assert result.error.code is ErrorCode.INTERNAL_ERROR
+        assert EventType.TOOL_FAILED in sink.types()
+        assert await wait_dead(pids[0])
+    finally:
+        for pid in pids:
+            kill_pid(pid)
 
 
 @pytest.mark.parametrize(

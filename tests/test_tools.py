@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -20,6 +23,15 @@ from coding_agent.tools.filesystem import (
 )
 from coding_agent.tools.search import SearchTool
 from coding_agent.tools.shell import ShellTool
+from proc_helpers import (
+    cleanup_pids,
+    descendant_writer_code,
+    kill_pid,
+    pid_alive,
+    pid_writer_code,
+    wait_dead,
+    wait_for_pids,
+)
 
 Invoke = Callable[..., Awaitable[ToolResult]]
 
@@ -367,3 +379,244 @@ async def test_shell_cwd_is_repo_root(invoke_tool: Invoke, repo: Path) -> None:
     result = await invoke_tool(ShellTool(), {"command": "pwd"})
     assert result.status is ToolResultStatus.SUCCESS
     assert Path(result.output["stdout"].strip()).samefile(repo)
+
+
+# --- shell subprocess lifecycle: bounded direct-child cleanup --- #
+
+
+def _fail_first_wait(
+    monkeypatch: pytest.MonkeyPatch, pid_file: Path, exc: BaseException
+) -> Callable[..., Any]:
+    """Make the shell's communicate wait raise ``exc`` after the child records a pid."""
+    real_wait_for = asyncio.wait_for
+    calls = 0
+
+    async def _fake(aw: Any, timeout: float) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            deadline = time.monotonic() + 2.0
+            while not pid_file.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            aw.close()
+            raise exc
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", _fake)
+    return real_wait_for
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_shell_timeout_kills_direct_child(
+    invoke_tool: Invoke,
+    repo: Path,
+    pycmd: Callable[[str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_file = repo / "shell-timeout.pid"
+    real_wait_for = asyncio.wait_for
+    calls = 0
+
+    async def _after_setup(aw: Any, timeout: float) -> Any:
+        # Start the shell timeout only after the child is running, so slow
+        # interpreter startup cannot consume the timeout before setup completes.
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            deadline = time.monotonic() + 2.0
+            while not pid_file.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert pid_file.exists(), "shell child did not finish setup"
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", _after_setup)
+    pids: list[int] = []
+    try:
+        result = await real_wait_for(
+            invoke_tool(
+                ShellTool(), {"command": pycmd(pid_writer_code(pid_file))}, timeout_ms=1000
+            ),
+            timeout=5.0,
+        )
+        pids = await wait_for_pids(pid_file)
+        assert result.status is ToolResultStatus.TIMEOUT
+        assert result.error is not None
+        assert result.error.code is ErrorCode.TIMEOUT
+        assert await wait_dead(pids[0])
+    finally:
+        for pid in pids:
+            kill_pid(pid)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_shell_timeout_is_bounded_when_descendant_holds_pipes(
+    invoke_tool: Invoke,
+    repo: Path,
+    pycmd: Callable[[str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_file = repo / "shell-timeout-tree.pid"
+    real_wait_for = asyncio.wait_for
+    timeout_started: list[float] = []
+    calls = 0
+
+    async def _after_setup(aw: Any, timeout: float) -> Any:
+        # Start the shell timeout only after the descendant is running, so slow
+        # interpreter startup cannot consume the timeout before setup completes.
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            deadline = time.monotonic() + 2.0
+            while not pid_file.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert pid_file.exists(), "shell child did not finish setup"
+            timeout_started.append(time.monotonic())
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", _after_setup)
+    pids: list[int] = []
+    try:
+        result = await real_wait_for(
+            invoke_tool(
+                ShellTool(), {"command": pycmd(descendant_writer_code(pid_file))}, timeout_ms=200
+            ),
+            timeout=5.0,
+        )
+        elapsed = time.monotonic() - timeout_started[0]
+        pids = await wait_for_pids(pid_file)
+        assert result.status is ToolResultStatus.TIMEOUT
+        assert result.error is not None
+        assert result.error.code is ErrorCode.TIMEOUT
+        assert elapsed < 1.5
+        assert await wait_dead(pids[0])
+        # Descendants are not terminated; this is a documented limitation.
+        assert pid_alive(pids[1])
+    finally:
+        await cleanup_pids(pid_file, pids)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_shell_cancellation_kills_direct_child(
+    invoke_tool: Invoke, repo: Path, pycmd: Callable[[str], str]
+) -> None:
+    pid_file = repo / "shell-cancel.pid"
+    task = asyncio.create_task(
+        invoke_tool(
+            ShellTool(), {"command": pycmd(pid_writer_code(pid_file))}, timeout_ms=30_000
+        )
+    )
+    pids: list[int] = []
+    try:
+        pids = await wait_for_pids(pid_file)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await wait_dead(pids[0])
+    finally:
+        if not task.done():
+            task.cancel()
+        for pid in pids:
+            kill_pid(pid)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_shell_keyboard_interrupt_kills_direct_child(
+    invoke_tool: Invoke,
+    repo: Path,
+    pycmd: Callable[[str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_file = repo / "shell-interrupt.pid"
+    real_wait_for = _fail_first_wait(monkeypatch, pid_file, KeyboardInterrupt())
+    pids: list[int] = []
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            await real_wait_for(
+                invoke_tool(
+                    ShellTool(), {"command": pycmd(pid_writer_code(pid_file))}, timeout_ms=30_000
+                ),
+                timeout=5.0,
+            )
+        pids = await wait_for_pids(pid_file)
+        assert await wait_dead(pids[0])
+    finally:
+        for pid in pids:
+            kill_pid(pid)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_shell_unexpected_exception_kills_direct_child(
+    invoke_tool: Invoke,
+    repo: Path,
+    pycmd: Callable[[str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_file = repo / "shell-error.pid"
+    real_wait_for = _fail_first_wait(monkeypatch, pid_file, RuntimeError("shell boom"))
+    pids: list[int] = []
+    try:
+        with pytest.raises(RuntimeError, match="shell boom"):
+            await real_wait_for(
+                invoke_tool(
+                    ShellTool(), {"command": pycmd(pid_writer_code(pid_file))}, timeout_ms=30_000
+                ),
+                timeout=5.0,
+            )
+        pids = await wait_for_pids(pid_file)
+        assert await wait_dead(pids[0])
+    finally:
+        for pid in pids:
+            kill_pid(pid)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_shell_repeated_cancellation_during_cleanup_supersedes_original(
+    invoke_tool: Invoke,
+    repo: Path,
+    pycmd: Callable[[str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation arriving during cleanup propagates; the child is still killed."""
+    pid_file = repo / "shell-repeat-cancel.pid"
+    real_wait_for = asyncio.wait_for
+    cleanup_started = asyncio.Event()
+    calls = 0
+
+    async def _fake(aw: Any, timeout: float) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            deadline = time.monotonic() + 2.0
+            while not pid_file.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            aw.close()
+            raise RuntimeError("shell boom")
+        cleanup_started.set()
+        try:
+            await asyncio.sleep(10)
+        finally:
+            aw.close()
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", _fake)
+    task = asyncio.create_task(
+        invoke_tool(
+            ShellTool(), {"command": pycmd(pid_writer_code(pid_file))}, timeout_ms=30_000
+        )
+    )
+    pids: list[int] = []
+    try:
+        deadline = time.monotonic() + 2.0
+        while not cleanup_started.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert cleanup_started.is_set(), "cleanup did not start"
+        pids = await wait_for_pids(pid_file)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await wait_dead(pids[0])
+    finally:
+        if not task.done():
+            task.cancel()
+        for pid in pids:
+            kill_pid(pid)

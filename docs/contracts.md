@@ -536,6 +536,20 @@ Steps 1–2 run **before** the policy decision so a human is never asked to appr
 a call that was always going to fail validation. Step 5 re-validates the resolved
 path **after** approval because the filesystem may change in between.
 
+**Shell subprocess lifecycle.** The `shell` tool owns cleanup of its direct
+subprocess. On timeout, cancellation, `KeyboardInterrupt`, or an unexpected
+ordinary exception it performs best-effort cleanup of the direct child: it kills
+it and waits for it under a 0.5 s grace period before returning or propagating,
+so cleanup is bounded by that grace period plus normal scheduling overhead.
+Ordinary cleanup errors are suppressed; a cancellation delivered during cleanup
+propagates and supersedes the exception being handled. Descendants are not
+terminated — no process-group management is performed — so one may outlive a
+cancelled or timed-out call, and a descendant that inherits `stdout`/`stderr`
+can keep the pipe readers open. Cleanup terminates processes only; it does not
+undo side effects already produced (files written, external calls made).
+Cancellation propagation and the runtime's exceptional-exit handling (D26) are
+unchanged.
+
 ---
 
 # 18. ToolResult

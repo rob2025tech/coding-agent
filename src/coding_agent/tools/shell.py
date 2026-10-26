@@ -3,6 +3,10 @@
 Authorization happens in the executor (policy + approver) *before* this runs.
 The command is never passed to a shell: it is split with :func:`shlex.split` and
 executed via ``create_subprocess_exec`` (argv form), pinned to ``repo_root``.
+
+The tool owns its direct subprocess: on timeout, cancellation,
+``KeyboardInterrupt``, or an unexpected exception it kills the direct child and
+bounds the reap wait. Descendants are not terminated.
 """
 
 from __future__ import annotations
@@ -20,6 +24,25 @@ from coding_agent.contracts import (
     ToolResultStatus,
 )
 from coding_agent.tools.base import Tool, ToolInvocation, error_result, success_result
+
+_CLEANUP_GRACE_S = 0.5
+
+
+async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
+    """Kill the direct child and bound the reap wait.
+
+    The bound keeps pipe-holding descendants from blocking cleanup. Ordinary
+    cleanup failures are suppressed. A cancellation delivered during the bounded
+    wait is not suppressed; it propagates and supersedes the exception being
+    handled, after the child has been killed.
+    """
+    try:
+        if proc.returncode is None:
+            proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=_CLEANUP_GRACE_S)
+    except Exception:
+        # Do not let ordinary cleanup errors replace the exception being propagated.
+        pass
 
 
 class ShellTool(Tool):
@@ -79,14 +102,16 @@ class ShellTool(Tool):
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await _terminate_process(proc)
             return error_result(
                 invocation.tool_call_id,
                 ErrorCode.TIMEOUT,
                 f"command timed out after {timeout_s}s",
                 status=ToolResultStatus.TIMEOUT,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, Exception):
+            await _terminate_process(proc)
+            raise
 
         output = {
             "command": command,

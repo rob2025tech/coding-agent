@@ -24,12 +24,23 @@ from coding_agent.events import AgentEvent, CallbackEventSink, EventSink, NullEv
 from coding_agent.executor import ToolExecutor
 from coding_agent.permissions import CliApprover, PermissionPolicy
 from coding_agent.providers.base import ModelProvider
-from coding_agent.providers.http import HttpModelProvider
+from coding_agent.providers.http import DEFAULT_HTTP_TIMEOUT_S, HttpModelProvider
 from coding_agent.providers.mock import MockModelProvider
 from coding_agent.runtime import AgentRuntime, new_session_id
 from coding_agent.tools.registry import default_registry
 from coding_agent.verification import DEFAULT_VERIFY_TIMEOUT_S, Verifier
 from coding_agent.workspace import Workspace
+
+
+def _positive_seconds(value: str) -> float:
+    """Argparse type for a strictly positive duration in seconds."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number") from None
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return seconds
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -43,6 +54,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="mock",
         choices=["mock", "http"],
         help="Model provider: mock (default, offline) or http (real endpoint via env).",
+    )
+    parser.add_argument(
+        "--http-timeout",
+        type=_positive_seconds,
+        default=DEFAULT_HTTP_TIMEOUT_S,
+        dest="http_timeout",
+        help="HTTP request timeout in seconds (default: 60).",
     )
     parser.add_argument(
         "--verify", default=None, help="Human-supplied verify command (single argv; D14)."
@@ -65,15 +83,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_provider(name: str) -> ModelProvider:
+def _build_provider(
+    name: str, *, http_timeout_s: float = DEFAULT_HTTP_TIMEOUT_S
+) -> ModelProvider:
     if name == "mock":
         return MockModelProvider([])
     if name == "http":
-        return _build_http_provider()
+        return _build_http_provider(http_timeout_s=http_timeout_s)
     raise SystemExit(f"unknown provider: {name} (available: mock, http)")
 
 
-def _build_http_provider() -> ModelProvider:
+def _build_http_provider(
+    *, http_timeout_s: float = DEFAULT_HTTP_TIMEOUT_S
+) -> ModelProvider:
     """Build the HTTP provider from non-secret env config (D21).
 
     ``CODING_AGENT_ENDPOINT`` (full request URL) and ``CODING_AGENT_MODEL`` are
@@ -87,7 +109,7 @@ def _build_http_provider() -> ModelProvider:
             "http provider requires CODING_AGENT_ENDPOINT and CODING_AGENT_MODEL "
             "environment variables"
         )
-    return HttpModelProvider(endpoint=endpoint, model_id=model)
+    return HttpModelProvider(endpoint=endpoint, model_id=model, timeout_s=http_timeout_s)
 
 
 def _resolve_limits(args: argparse.Namespace) -> Limits:
@@ -126,7 +148,9 @@ def build_runtime(
     verifier = Verifier(
         args.verify, repo_root=workspace.repo_root, timeout_s=args.verify_timeout
     )
-    model_provider = provider or _build_provider(args.provider)
+    model_provider = provider or _build_provider(
+        args.provider, http_timeout_s=args.http_timeout
+    )
     context_builder = ContextBuilder(ModelRef.from_descriptor(model_provider.describe()))
     executor = ToolExecutor(
         registry=registry,

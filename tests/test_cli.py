@@ -16,7 +16,7 @@ from coding_agent.cli import (
 )
 from coding_agent.contracts import Limits, SessionState
 from coding_agent.events import NullEventSink
-from coding_agent.providers.http import HttpModelProvider
+from coding_agent.providers.http import DEFAULT_HTTP_TIMEOUT_S, HttpModelProvider
 from coding_agent.providers.mock import MockModelProvider
 from coding_agent.runtime import AgentRuntime
 from coding_agent.verification import DEFAULT_VERIFY_TIMEOUT_S
@@ -31,6 +31,7 @@ def test_defaults() -> None:
     assert args.provider == "mock"
     assert args.verify is None
     assert args.verify_timeout == DEFAULT_VERIFY_TIMEOUT_S == 120.0
+    assert args.http_timeout == DEFAULT_HTTP_TIMEOUT_S == 60.0
     assert args.yes is False
     # Limit overrides default to None so _resolve_limits falls back to Limits().
     assert args.max_turns is None
@@ -53,6 +54,18 @@ def test_provider_choices_reject_unknown() -> None:
         build_arg_parser().parse_args(["--provider", "openai", "x"])
 
 
+@pytest.mark.parametrize("value", ["0", "-2.5"])
+def test_http_timeout_rejects_non_positive(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        build_arg_parser().parse_args(["--http-timeout", value, "x"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "--http-timeout" in err
+    assert "must be greater than 0" in err
+
+
 def test_build_provider_mock_and_unknown() -> None:
     assert isinstance(_build_provider("mock"), MockModelProvider)
     with pytest.raises(SystemExit):
@@ -70,6 +83,34 @@ def test_build_provider_http_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = _build_provider("http")
     assert isinstance(provider, HttpModelProvider)
     assert provider.describe().model_id == "some-model"
+
+
+@pytest.mark.parametrize(
+    ("extra_argv", "expected_s"),
+    [([], DEFAULT_HTTP_TIMEOUT_S), (["--http-timeout", "180"], 180.0)],
+)
+def test_http_timeout_reaches_http_provider(
+    extra_argv: list[str],
+    expected_s: float,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODING_AGENT_ENDPOINT", "https://provider.invalid/v1/chat/completions")
+    monkeypatch.setenv("CODING_AGENT_MODEL", "some-model")
+    captured: dict[str, object] = {}
+
+    def _capture_provider(**kwargs: object) -> MockModelProvider:
+        captured.update(kwargs)
+        return MockModelProvider([])
+
+    monkeypatch.setattr("coding_agent.cli.HttpModelProvider", _capture_provider)
+    args = build_arg_parser().parse_args(
+        ["--repo", str(repo), "--provider", "http", *extra_argv, "task"]
+    )
+    build_runtime(args, event_sink=NullEventSink())
+    assert captured["endpoint"] == "https://provider.invalid/v1/chat/completions"
+    assert captured["model_id"] == "some-model"
+    assert captured["timeout_s"] == expected_s
 
 
 def test_build_provider_http_requires_endpoint_and_model(
@@ -167,7 +208,7 @@ def test_main_prints_final_answer_to_stdout(
     # answer on stdout, while stderr keeps carrying only event/status telemetry.
     from coding_agent.providers.mock import final_response
 
-    def _scripted(_name: str) -> MockModelProvider:
+    def _scripted(_name: str, **_kwargs: object) -> MockModelProvider:
         return MockModelProvider([final_response("FINAL-ANSWER-OK")])
 
     monkeypatch.setattr("coding_agent.cli._build_provider", _scripted)
@@ -205,7 +246,7 @@ def test_main_recovery_flow_prints_only_corrected_answer(
             final_response("CORRECTED-FINAL-ANSWER"),
         ]
     )
-    monkeypatch.setattr("coding_agent.cli._build_provider", lambda _name: provider)
+    monkeypatch.setattr("coding_agent.cli._build_provider", lambda _name, **_kwargs: provider)
     verify = pycmd(
         "import pathlib,sys; sys.exit(0 if 'TARGET' in pathlib.Path('hello.py').read_text() else 1)"
     )
@@ -269,7 +310,7 @@ def test_main_end_to_end_coding_workflow(
             final_response("E2E-FIX-COMPLETED"),
         ]
     )
-    monkeypatch.setattr("coding_agent.cli._build_provider", lambda _name: provider)
+    monkeypatch.setattr("coding_agent.cli._build_provider", lambda _name, **_kwargs: provider)
     verify = pycmd(
         "import pathlib,sys; "
         "sys.exit(0 if 'Fully-fixed' in pathlib.Path('hello.py').read_text() else 1)"

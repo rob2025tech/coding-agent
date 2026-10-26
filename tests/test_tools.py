@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import stat
 import sys
@@ -22,10 +23,12 @@ from coding_agent.tools.filesystem import (
     WriteFileTool,
 )
 from coding_agent.tools.search import SearchTool
-from coding_agent.tools.shell import ShellTool
+from coding_agent.tools.shell import ShellTool, _release_readers
 from proc_helpers import (
     cleanup_pids,
     descendant_writer_code,
+    exiting_writer_code,
+    failing_exiting_writer_code,
     kill_pid,
     pid_alive,
     pid_writer_code,
@@ -496,6 +499,79 @@ async def test_shell_timeout_is_bounded_when_descendant_holds_pipes(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_shell_reports_success_after_direct_child_exits_with_pipe_holding_descendant(
+    invoke_tool: Invoke,
+    repo: Path,
+    pycmd: Callable[[str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the direct child exits 0 before the timeout, but its descendant
+    keeps the inherited stdout/stderr open. Exit-based completion means the command
+    succeeded; the current pipe-EOF-based wait reports TIMEOUT instead."""
+    pid_file = repo / "shell-exited-child.pid"
+    real_wait_for = asyncio.wait_for
+    calls = 0
+
+    async def _after_child_exit(aw: Any, timeout: float) -> Any:
+        # Arm the shell timeout only once both pids are recorded and the direct
+        # child is gone, so neither startup nor exit can race the timeout.
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            pids = await wait_for_pids(pid_file)
+            assert await wait_dead(pids[0]), "direct child did not exit before the timeout"
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", _after_child_exit)
+    pids: list[int] = []
+    try:
+        result = await real_wait_for(
+            invoke_tool(
+                ShellTool(), {"command": pycmd(exiting_writer_code(pid_file))}, timeout_ms=200
+            ),
+            timeout=5.0,
+        )
+        pids = await wait_for_pids(pid_file)
+        assert not pid_alive(pids[0]), "direct child must have exited before the timeout"
+        assert result.status is ToolResultStatus.SUCCESS, (
+            f"direct child exited before the timeout, but the tool reported "
+            f"status={result.status!r} error={result.error!r} output={result.output!r}"
+        )
+        assert result.output["exit_code"] == 0
+    finally:
+        await cleanup_pids(pid_file, pids)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_shell_captures_pipes_after_nonzero_exit_with_pipe_holding_descendant(
+    invoke_tool: Invoke, repo: Path, pycmd: Callable[[str], str]
+) -> None:
+    """The direct child's nonzero exit is authoritative, and output it already wrote
+    survives the bounded drain while a descendant keeps the inherited pipes open."""
+    pid_file = repo / "shell-failed-child.pid"
+    pids: list[int] = []
+    try:
+        result = await asyncio.wait_for(
+            invoke_tool(
+                ShellTool(),
+                {"command": pycmd(failing_exiting_writer_code(pid_file))},
+                timeout_ms=2000,
+            ),
+            timeout=5.0,
+        )
+        pids = await wait_for_pids(pid_file)
+        assert result.status is ToolResultStatus.FAILURE
+        assert result.error is not None
+        assert result.error.code is ErrorCode.EXECUTION_FAILED
+        assert result.error.message == "command exited with code 3"
+        assert result.output["exit_code"] == 3
+        assert "direct-out" in result.output["stdout"]
+        assert "direct-err" in result.output["stderr"]
+    finally:
+        await cleanup_pids(pid_file, pids)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
 async def test_shell_cancellation_kills_direct_child(
     invoke_tool: Invoke, repo: Path, pycmd: Callable[[str], str]
 ) -> None:
@@ -622,3 +698,52 @@ async def test_shell_repeated_cancellation_during_cleanup_supersedes_original(
             task.cancel()
         for pid in pids:
             kill_pid(pid)
+
+
+class _FakePipeTransport:
+    """Minimal stand-in for the subprocess transport in cleanup tests."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+    def close(self) -> None:
+        self.closed = True
+
+
+async def test_release_readers_finishes_pending_readers_after_repeated_cancellation() -> None:
+    """A cancellation during cleanup must not abandon a reader that is still
+    winding down: the wait resumes, the reader is observed to completion, the
+    transport is closed, and the cancellation still propagates."""
+    cancelled_once = asyncio.Event()
+
+    async def reader_absorbing_one_cancellation() -> None:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled_once.set()
+        await asyncio.sleep(0.05)
+
+    reader = asyncio.create_task(reader_absorbing_one_cancellation())
+    transport = _FakePipeTransport()
+    cleanup = asyncio.create_task(_release_readers([reader], transport))
+    try:
+        await asyncio.wait_for(cancelled_once.wait(), timeout=2.0)
+        cleanup.cancel()
+        await asyncio.sleep(0.01)
+        cleanup.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        assert reader.done(), "reader left pending after cleanup returned"
+        assert not reader.cancelled(), "reader was abandoned mid-completion"
+        assert transport.closed
+    finally:
+        reader.cancel()
+        if not cleanup.done():
+            cleanup.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cleanup
+        with contextlib.suppress(asyncio.CancelledError):
+            await reader

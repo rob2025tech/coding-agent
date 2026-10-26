@@ -20,7 +20,14 @@ from coding_agent.contracts import (
 )
 from coding_agent.events import EventType, ListEventSink
 from coding_agent.executor import ToolExecutor
-from proc_helpers import kill_pid, pid_writer_code, wait_dead, wait_for_pids
+from proc_helpers import (
+    cleanup_pids,
+    exiting_writer_code,
+    kill_pid,
+    pid_writer_code,
+    wait_dead,
+    wait_for_pids,
+)
 
 SESSION = "s1"
 
@@ -300,6 +307,35 @@ async def test_unexpected_tool_exception_cleans_child_and_returns_internal_error
     finally:
         for pid in pids:
             kill_pid(pid)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness checks")
+async def test_tool_reports_success_after_direct_child_exits_with_pipe_holding_descendant(
+    make_executor: Callable[..., ToolExecutor],
+    repo: Path,
+    pycmd: Callable[[str], str],
+) -> None:
+    """The direct child exits 0 while its descendant keeps the inherited pipes open.
+
+    Exit-based completion must surface success through the executor's own timeout
+    and result handling, not just when ``ShellTool`` is called directly.
+    """
+    sink = ListEventSink()
+    # Bounded so a completion regression fails in ~2 s instead of waiting 30 s.
+    executor = make_executor(approver=RecordingApprover(True), sink=sink, timeout_ms=2000)
+    pid_file = repo / "executor-exited-child.pid"
+    pids: list[int] = []
+    try:
+        result = await executor.execute(
+            ToolCall("c1", "shell", {"command": pycmd(exiting_writer_code(pid_file))}),
+            session_id=SESSION,
+        )
+        pids = await wait_for_pids(pid_file)
+        assert result.status is ToolResultStatus.SUCCESS
+        assert result.output["exit_code"] == 0
+        assert EventType.TOOL_COMPLETED in sink.types()
+    finally:
+        await cleanup_pids(pid_file, pids)
 
 
 @pytest.mark.parametrize(

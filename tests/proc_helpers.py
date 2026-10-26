@@ -34,6 +34,37 @@ def descendant_writer_code(pid_file: Path, *, seconds: float = 30.0) -> str:
     )
 
 
+def exiting_writer_code(pid_file: Path, *, seconds: float = 10.0) -> str:
+    """Python source whose direct child spawns a pipe-inheriting descendant, records
+    both pids, and then exits successfully while the descendant keeps running."""
+    return (
+        "import os, pathlib, subprocess; "
+        f"child = subprocess.Popen(['sleep', '{seconds:g}']); "
+        f"target = pathlib.Path({str(pid_file)!r}); "
+        "tmp = target.with_suffix('.tmp'); "
+        "tmp.write_text(f'{os.getpid()} {child.pid}\\n'); "
+        "os.replace(tmp, target)"
+    )
+
+
+def failing_exiting_writer_code(
+    pid_file: Path, *, seconds: float = 10.0, exit_code: int = 3
+) -> str:
+    """Python source that writes to both pipes, spawns a pipe-inheriting descendant,
+    records both pids, and then exits nonzero while the descendant keeps running."""
+    return (
+        "import os, pathlib, subprocess, sys; "
+        f"child = subprocess.Popen(['sleep', '{seconds:g}']); "
+        f"target = pathlib.Path({str(pid_file)!r}); "
+        "tmp = target.with_suffix('.tmp'); "
+        "tmp.write_text(f'{os.getpid()} {child.pid}\\n'); "
+        "os.replace(tmp, target); "
+        "sys.stdout.write('direct-out\\n'); sys.stdout.flush(); "
+        "sys.stderr.write('direct-err\\n'); sys.stderr.flush(); "
+        f"sys.exit({exit_code})"
+    )
+
+
 async def wait_for_pids(pid_file: Path, *, timeout_s: float = 2.0) -> list[int]:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:

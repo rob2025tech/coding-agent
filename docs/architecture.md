@@ -405,19 +405,23 @@ human is never asked to approve a call that was always going to fail validation.
 The path is re-validated **after** approval because the filesystem may change in
 between.
 
-**Shell subprocess lifecycle.** The `shell` tool owns its direct subprocess. On
-timeout, cancellation, `KeyboardInterrupt`, or an unexpected ordinary exception
-it performs best-effort cleanup of the direct child: it kills it and waits at
+**Shell subprocess lifecycle.** Completion follows the direct child: when it
+exits within the timeout, the tool drains `stdout`/`stderr` for at most a 0.5 s
+grace period and returns its exit status with the output captured so far. A
+descendant that inherits `stdout`/`stderr` can keep the pipes open and truncate
+output written after that bound, but it cannot make an exited child's command
+report a timeout. The `shell` tool owns its direct subprocess. On timeout,
+cancellation, `KeyboardInterrupt`, or an unexpected ordinary exception it
+performs best-effort cleanup of the direct child: it kills it and waits at
 most a 0.5 s grace period for it before returning or propagating, so cleanup is
 bounded by that grace period plus normal scheduling overhead. Ordinary cleanup
 errors are suppressed, but a cancellation delivered during cleanup is not: it
 propagates and supersedes the exception being handled. Descendants are not
-terminated (there is no process-group management), so one may outlive a
-cancelled or timed-out shell call; a descendant that inherits `stdout`/`stderr`
-can also keep the pipe readers open. Cleanup terminates processes only; it does
-not undo side effects already produced (files written, external calls made).
-Cancellation propagation and the runtime's exceptional-exit handling (D26) are
-unchanged.
+terminated (there is no process-group management), so one may outlive a shell
+call or a successfully completed command. Cleanup terminates processes only; it
+does not undo side effects already produced (files written, external calls
+made). Cancellation propagation and the runtime's exceptional-exit handling
+(D26) are unchanged.
 
 The model must never receive direct access to the host operating system.
 

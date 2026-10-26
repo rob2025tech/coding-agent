@@ -251,11 +251,15 @@ async def test_keyboard_interrupt_kills_and_reaps_child(
     verifier = Verifier(
         pycmd(_pid_writer_code(pid_file)), repo_root=str(repo), timeout_s=30.0
     )
-    real_wait_for = _fail_first_wait(monkeypatch, pid_file, KeyboardInterrupt())
+    # Same 3.11 hazard as test_shell_keyboard_interrupt_kills_direct_child: an
+    # outer asyncio.wait_for() wraps the call in a Task, and a KeyboardInterrupt
+    # raised inside a Task is re-raised into the event loop, aborting the session.
+    _fail_first_wait(monkeypatch, pid_file, KeyboardInterrupt())
     pids: list[int] = []
     try:
         with pytest.raises(KeyboardInterrupt):
-            await real_wait_for(verifier.run(), timeout=5.0)
+            async with asyncio.timeout(5.0):
+                await verifier.run()
         pids = await _wait_for_pids(pid_file)
         assert await _wait_dead(pids[0])
     finally:

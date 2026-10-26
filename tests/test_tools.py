@@ -527,16 +527,18 @@ async def test_shell_keyboard_interrupt_kills_direct_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pid_file = repo / "shell-interrupt.pid"
-    real_wait_for = _fail_first_wait(monkeypatch, pid_file, KeyboardInterrupt())
+    # Keep the injected KeyboardInterrupt in this task: on 3.11 an outer
+    # asyncio.wait_for() wraps the tool call in a Task, and a KeyboardInterrupt
+    # raised inside a Task is re-raised into the event loop, aborting the session
+    # even though pytest.raises matches it (3.12 removed the task wrapping).
+    _fail_first_wait(monkeypatch, pid_file, KeyboardInterrupt())
     pids: list[int] = []
     try:
         with pytest.raises(KeyboardInterrupt):
-            await real_wait_for(
-                invoke_tool(
+            async with asyncio.timeout(5.0):
+                await invoke_tool(
                     ShellTool(), {"command": pycmd(pid_writer_code(pid_file))}, timeout_ms=30_000
-                ),
-                timeout=5.0,
-            )
+                )
         pids = await wait_for_pids(pid_file)
         assert await wait_dead(pids[0])
     finally:

@@ -447,6 +447,16 @@ the verify command.
   ASK). It runs via the Verifier directly — not through the model's tool-call
   path — with argv from `shlex.split`, `shell=False`, `cwd=repo_root`, and the
   `--verify-timeout` bound.
+* **Process lifecycle:** the Verifier owns its subprocess. On cancellation,
+  `KeyboardInterrupt`, or an unexpected exception it kills the direct child and
+  waits at most a 0.5 s grace period for it before propagating; on timeout it
+  kills the direct child and waits the same grace period, so a timed-out
+  `Verifier.run()` returns after approximately the configured timeout plus 0.5 s
+  and normal scheduling overhead, even when a descendant inherits
+  `stdout`/`stderr`; this is not a strict wall-clock deadline. A cancellation
+  delivered during the bounded cleanup wait propagates and supersedes the
+  exception being handled. Descendants are not terminated (there is no
+  process-group management), so one may outlive a cancelled or timed-out run.
 * **Trigger:** when the model signals completion and any **write** has occurred
   since the last passing verification, the runtime runs the verifier. On failure,
   the result is appended to context and the loop continues (bounded by limits).

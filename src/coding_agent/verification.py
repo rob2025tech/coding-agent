@@ -21,6 +21,7 @@ _HEAD_CHARS = 4000
 _TAIL_CHARS = 4000
 TRUNCATION_MARKER = "...[truncated]..."
 DEFAULT_VERIFY_TIMEOUT_S = 120.0
+_CLEANUP_GRACE_S = 0.5
 
 
 def truncate_output(text: str) -> str:
@@ -33,6 +34,23 @@ def truncate_output(text: str) -> str:
     if len(text) <= VERIFY_OUTPUT_MAX_CHARS:
         return text
     return f"{text[:_HEAD_CHARS]}{TRUNCATION_MARKER}{text[-_TAIL_CHARS:]}"
+
+
+async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
+    """Kill the direct child and bound the reap wait.
+
+    The bound keeps pipe-holding descendants from blocking cleanup. Ordinary
+    cleanup failures are suppressed. A cancellation delivered during the bounded
+    wait is not suppressed; it propagates and supersedes the exception being
+    handled, after the child has been killed.
+    """
+    try:
+        if proc.returncode is None:
+            proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=_CLEANUP_GRACE_S)
+    except Exception:
+        # Do not let ordinary cleanup errors replace the exception being propagated.
+        pass
 
 
 class Verifier:
@@ -113,10 +131,12 @@ class Verifier:
                     proc.communicate(), timeout=self.timeout_s
                 )
             except TimeoutError:
-                proc.kill()
-                await proc.wait()
+                await _terminate_process(proc)
                 stdout_b, stderr_b = b"", b""
                 timed_out = True
+            except (asyncio.CancelledError, KeyboardInterrupt, Exception):
+                await _terminate_process(proc)
+                raise
 
         combined = stdout_b.decode("utf-8", errors="replace") + stderr_b.decode(
             "utf-8", errors="replace"

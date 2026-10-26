@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import os
 import py_compile
 import shlex
+import signal
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -110,6 +114,265 @@ async def test_verifier_timeout(repo: Path, sleep_cmd: str) -> None:
     result = await verifier.run()
     assert result.passed is False
     assert result.timed_out is True
+
+
+# --- subprocess lifecycle: cancellation, exceptions, timeout cleanup -------- #
+
+
+def _pid_writer_code(pid_file: Path, *, seconds: float = 10.0) -> str:
+    return (
+        "import os, pathlib, time; "
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+        f"time.sleep({seconds})"
+    )
+
+
+async def _wait_for_pids(pid_file: Path, *, timeout_s: float = 2.0) -> list[int]:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if pid_file.exists():
+            values = pid_file.read_text(encoding="utf-8").split()
+            if values:
+                return [int(value) for value in values]
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"verifier child did not record pids in {pid_file}")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _wait_dead(pid: int, *, timeout_s: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+def _kill_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _read_pids(path: Path) -> list[int]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    if not text.endswith("\n"):
+        return []
+    pids: list[int] = []
+    for value in text.split():
+        try:
+            pid = int(value)
+        except ValueError:
+            continue
+        if pid > 1 and pid not in {os.getpid(), os.getppid()} and pid not in pids:
+            pids.append(pid)
+    return pids
+
+
+async def _cleanup_pids(
+    pid_file: Path, known: list[int], *, timeout_s: float = 0.5
+) -> None:
+    """Kill known and recorded PIDs, allowing a late atomic write to land."""
+    deadline = time.monotonic() + timeout_s
+    pids = [
+        pid
+        for pid in dict.fromkeys(known)
+        if pid > 1 and pid not in {os.getpid(), os.getppid()}
+    ]
+    while True:
+        for path in (pid_file, pid_file.with_suffix(".tmp")):
+            for pid in _read_pids(path):
+                if pid not in pids:
+                    pids.append(pid)
+        if len(pids) >= 2 or time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.02)
+    for pid in pids:
+        _kill_pid(pid)
+
+
+def _fail_first_wait(
+    monkeypatch: pytest.MonkeyPatch, pid_file: Path, exc: BaseException
+) -> Callable[..., Any]:
+    """Make the verifier's first wait raise ``exc`` after its child records a pid."""
+    real_wait_for = asyncio.wait_for
+    calls = 0
+
+    async def _fake(aw: Any, timeout: float) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            deadline = time.monotonic() + 2.0
+            while not pid_file.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            aw.close()
+            raise exc
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", _fake)
+    return real_wait_for
+
+
+async def test_cancellation_kills_and_reaps_child(
+    repo: Path, pycmd: Callable[[str], str]
+) -> None:
+    pid_file = repo / "cancel.pid"
+    verifier = Verifier(
+        pycmd(_pid_writer_code(pid_file)), repo_root=str(repo), timeout_s=30.0
+    )
+    task = asyncio.create_task(verifier.run())
+    pids: list[int] = []
+    try:
+        pids = await _wait_for_pids(pid_file)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await _wait_dead(pids[0])
+    finally:
+        for pid in pids:
+            _kill_pid(pid)
+
+
+async def test_keyboard_interrupt_kills_and_reaps_child(
+    repo: Path, pycmd: Callable[[str], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = repo / "interrupt.pid"
+    verifier = Verifier(
+        pycmd(_pid_writer_code(pid_file)), repo_root=str(repo), timeout_s=30.0
+    )
+    real_wait_for = _fail_first_wait(monkeypatch, pid_file, KeyboardInterrupt())
+    pids: list[int] = []
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            await real_wait_for(verifier.run(), timeout=5.0)
+        pids = await _wait_for_pids(pid_file)
+        assert await _wait_dead(pids[0])
+    finally:
+        for pid in pids:
+            _kill_pid(pid)
+
+
+async def test_unexpected_exception_kills_and_reaps_child(
+    repo: Path, pycmd: Callable[[str], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = repo / "error.pid"
+    verifier = Verifier(
+        pycmd(_pid_writer_code(pid_file)), repo_root=str(repo), timeout_s=30.0
+    )
+    real_wait_for = _fail_first_wait(monkeypatch, pid_file, RuntimeError("verifier boom"))
+    pids: list[int] = []
+    try:
+        with pytest.raises(RuntimeError, match="verifier boom"):
+            await real_wait_for(verifier.run(), timeout=5.0)
+        pids = await _wait_for_pids(pid_file)
+        assert await _wait_dead(pids[0])
+    finally:
+        for pid in pids:
+            _kill_pid(pid)
+
+
+async def test_repeated_cancellation_during_cleanup_supersedes_original(
+    repo: Path, pycmd: Callable[[str], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancellation arriving during cleanup propagates; the child is still killed."""
+    pid_file = repo / "repeat-cancel.pid"
+    verifier = Verifier(
+        pycmd(_pid_writer_code(pid_file)), repo_root=str(repo), timeout_s=30.0
+    )
+    real_wait_for = asyncio.wait_for
+    cleanup_started = asyncio.Event()
+    calls = 0
+
+    async def _fake(aw: Any, timeout: float) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            deadline = time.monotonic() + 2.0
+            while not pid_file.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            aw.close()
+            raise RuntimeError("verifier boom")
+        cleanup_started.set()
+        try:
+            await asyncio.sleep(10)
+        finally:
+            aw.close()
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", _fake)
+    task = asyncio.create_task(verifier.run())
+    pids: list[int] = []
+    try:
+        deadline = time.monotonic() + 2.0
+        while not cleanup_started.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert cleanup_started.is_set(), "cleanup did not start"
+        pids = await _wait_for_pids(pid_file)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await _wait_dead(pids[0])
+    finally:
+        if not task.done():
+            task.cancel()
+        for pid in pids:
+            _kill_pid(pid)
+
+
+async def test_timeout_is_bounded_when_descendant_holds_pipes(
+    repo: Path, pycmd: Callable[[str], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = repo / "timeout-tree.pid"
+    code = (
+        "import os, pathlib, subprocess, time; "
+        "child = subprocess.Popen(['sleep', '3']); "
+        f"target = pathlib.Path({str(pid_file)!r}); "
+        "tmp = target.with_suffix('.tmp'); "
+        "tmp.write_text(f'{os.getpid()} {child.pid}\\n'); "
+        "os.replace(tmp, target); "
+        "time.sleep(30)"
+    )
+    verifier = Verifier(pycmd(code), repo_root=str(repo), timeout_s=0.2)
+    real_wait_for = asyncio.wait_for
+    timeout_started: list[float] = []
+    calls = 0
+
+    async def _after_setup(aw: Any, timeout: float) -> Any:
+        # Start the verifier timeout only after the descendant is running, so slow
+        # interpreter startup cannot consume the timeout before setup completes.
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            deadline = time.monotonic() + 2.0
+            while not pid_file.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert pid_file.exists(), "verifier child did not finish setup"
+            timeout_started.append(time.monotonic())
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", _after_setup)
+    pids: list[int] = []
+    try:
+        result = await real_wait_for(verifier.run(), timeout=5.0)
+        elapsed = time.monotonic() - timeout_started[0]
+        pids = await _wait_for_pids(pid_file)
+        assert result.timed_out is True
+        assert result.passed is False
+        assert elapsed < 1.2
+        assert await _wait_dead(pids[0])
+    finally:
+        await _cleanup_pids(pid_file, pids)
 
 
 async def test_verifier_truncates_large_output(repo: Path, pycmd: Callable[[str], str]) -> None:

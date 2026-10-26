@@ -1151,6 +1151,10 @@ timed_out    bool
 
 `VERIFY_OUTPUT_MAX_CHARS = 8000`: when verifier output exceeds this, retain up to **4,000 chars from the head** and **4,000 chars from the tail**, joined by the marker `...[truncated]...`. The rendered string is **not** required to be exactly 8,000 chars — the marker adds characters. The verifier timeout defaults to **120s** (`--verify-timeout`, in seconds).
 
+The Verifier owns its subprocess lifecycle. On cancellation, `KeyboardInterrupt`, or an unexpected exception it kills the direct child and waits at most a half-second (0.5 s) grace period for it before propagating. On timeout it kills the direct child and waits at most that same grace period, so a timed-out `Verifier.run()` returns after approximately the configured timeout plus 0.5 s, plus normal scheduling overhead, even when a descendant keeps `stdout`/`stderr` open; this is not a strict wall-clock deadline. Descendants are not terminated.
+
+A cancellation delivered during the bounded cleanup wait is not swallowed: it propagates and supersedes the exception originally being propagated. The direct child has already been killed by that point.
+
 A verification is **stale** — and `passed` no longer counts — after any write: a successful `edit_file` **or** any `shell` execution not on the read-only allowlist (see §27 and architecture §4.8/§4.10).
 
 ---

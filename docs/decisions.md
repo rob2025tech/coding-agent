@@ -689,10 +689,11 @@ an exception now observe a terminal `session.state` and an attempted
 terminal-event emission, while the original exception object is still raised.
 A sink failure during a normal terminal transition still propagates, but the
 session keeps the terminal state already written. The CLI is unchanged,
-including exit codes and its lack of a handler for unexpected exceptions; the
-verifier subprocess is still not killed on cancellation. **Out of scope:** async
-approval, pause/resume, new state-change events, a state-transition validator,
-CLI exception/exit-code mapping, verifier subprocess cleanup, any
-exception-message redaction policy beyond "type name only", and the D23
-terminality-check duplication (now partially mitigated by the guard). **D23's
-citation typo is corrected** (`§24` → `§23`) as a documentation fix.
+including exit codes and its lack of a handler for unexpected exceptions.
+Verifier direct-child cleanup is owned by the Verifier, not by D26.
+**Out of scope:** async approval, pause/resume, new state-change events, a
+state-transition validator, CLI exception/exit-code mapping,
+process-group/descendant cleanup, any exception-message redaction policy beyond
+"type name only", and the D23 terminality-check duplication (now partially
+mitigated by the guard). **D23's citation typo is corrected** (`§24` → `§23`) as
+a documentation fix.

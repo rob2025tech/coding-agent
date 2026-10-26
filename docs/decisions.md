@@ -457,7 +457,7 @@ ASK-approved-then-run. The rest of the contract set already describes this phase
 without states — the normative tool loop (§27) specifies
 `check → DENY: append denied ToolResult, continue → ASK: Approver.confirm →
 execute → append ToolResult → emit events`; §37 requires that "All decisions emit
-events"; and §24/§34 use the "enters / transitions to `<STATE>`" idiom only for
+events"; and §23/§34 use the "enters / transitions to `<STATE>`" idiom only for
 states the runtime actually assigns — leaving architecture §5 as the sole
 outlier. Amending the documents instead of adding machinery mirrors how D22
 removed the §4.6-vs-§4.9 ambiguity by clarifying the layer split, and follows
@@ -633,3 +633,66 @@ contracts §30 deferred list to the authoritative contract §43. Architecture
 coexists with the shell path. All other §30 items and the D21/D23 deferrals
 (streaming, retries, provider routing/selection, cost/quota, persistence/resume,
 context compaction) remain deferred.
+
+---
+
+## D26. Exceptional exits: terminal-state recording on cancellation and errors (v0.2)
+
+**Decision.** `AgentRuntime.run()` gains a thin public wrapper around the
+existing loop so that every normal, cancelled, or `Exception`-based exit leaves
+the session in a terminal state. `SystemExit` and `GeneratorExit` are explicit
+exceptions: they pass through without that guarantee.
+
+* `asyncio.CancelledError` → best-effort `_terminate(session, INTERRUPTED,
+  "cancelled")` (emitting the existing `SessionInterrupted`), then re-raise the
+  cancellation unchanged.
+* `KeyboardInterrupt` → best-effort `_terminate(session, INTERRUPTED,
+  "interrupted")`, then re-raise unchanged.
+* Any other `Exception` → best-effort `_terminate(session, FAILED,
+  "unexpected error: <TypeName>")` (emitting the existing `SessionFailed`), then
+  re-raise unchanged. Only the exception **type** is recorded, never its message.
+* `SystemExit` and `GeneratorExit` are not intercepted.
+* Reconciliation is skipped when `session.state` is already in
+  `TERMINAL_STATES`, so a terminal state is never overwritten and a second
+  terminal event is never emitted.
+* Terminal-state recording (state, `completed_status`, timestamp) precedes event
+  emission and cannot fail for a valid `AgentSession`; terminal-event delivery is
+  best-effort on these paths. A sink failure during reconciliation is suppressed
+  so it cannot mask the original exception. The helper catches only `Exception`,
+  never `BaseException`.
+
+Provider failures are unchanged: exceptions from `describe()`/`generate()` are
+normalized through §25 into a **returned** `FAILED` session and do not raise.
+`EOFError` from the approval prompt remains an unexpected exception (`FAILED`).
+No new `SessionState`, `EventType`, `ErrorCode`, or dependency is introduced;
+`TERMINAL_STATES` becomes the guard's production reader.
+
+**Rationale.** Before D26, `run()` had no outer handler: a sink failure, context
+construction error, policy/approver exception, or cancellation escaping an
+`await` left the caller-held session in `RUNNING`, `MODEL_THINKING`,
+`PERMISSION_CHECK`, or `VERIFICATION_CHECK`, while architecture §5's "final state
+is always terminal" guarantee covered only normal returns. The architecture
+diagram already specifies "any active state → interruption → `INTERRUPTED`" and
+"→ unrecoverable error → `FAILED`", and §34 already treats deliberate
+operational stops as `INTERRUPTED` and failure conditions as `FAILED`; the
+contract was simply unenforced on exceptional exits. Recording the state while
+still re-raising preserves asyncio cancellation semantics, hides no programming
+errors, and keeps `CancelledError` from being normalized (D21). The wrapper is
+the smallest seam: the normal loop, `_finish_turn`/`_terminate`, executor,
+verifier, CLI, and provider paths are untouched.
+
+**Consequences.** Architecture §5 documents exceptional exits and rewrites the
+"no control-flow reader" sentence to name the single terminal-state guard. No
+behavior changes on successful or provider-error paths; existing tests that
+expect a returned `FAILED` session still pass. Callers that catch cancellation or
+an exception now observe a terminal `session.state` and an attempted
+terminal-event emission, while the original exception object is still raised.
+A sink failure during a normal terminal transition still propagates, but the
+session keeps the terminal state already written. The CLI is unchanged,
+including exit codes and its lack of a handler for unexpected exceptions; the
+verifier subprocess is still not killed on cancellation. **Out of scope:** async
+approval, pause/resume, new state-change events, a state-transition validator,
+CLI exception/exit-code mapping, verifier subprocess cleanup, any
+exception-message redaction policy beyond "type name only", and the D23
+terminality-check duplication (now partially mitigated by the guard). **D23's
+citation typo is corrected** (`§24` → `§23`) as a documentation fix.

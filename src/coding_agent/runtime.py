@@ -8,10 +8,17 @@ tool_calling capability gate.
 Limit -> terminal-state mapping (an implementation choice within §34's
 "INTERRUPTED or FAILED"): turns / tool-calls / wall-time -> INTERRUPTED;
 repeated failures -> FAILED.
+
+Exceptional exits (D26): normal completion, cancellation, and any
+Exception-based exit leave the session in a terminal state. Cancellation records
+INTERRUPTED, other exceptions record FAILED, and both are re-raised unchanged;
+SystemExit and GeneratorExit pass through without that guarantee. Provider
+failures already normalized into a returned FAILED session are unaffected.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import time
 import uuid
@@ -19,6 +26,7 @@ from typing import Any
 
 from coding_agent.context import ContextBuilder
 from coding_agent.contracts import (
+    TERMINAL_STATES,
     AgentSession,
     AgentTurn,
     ProviderError,
@@ -55,6 +63,27 @@ class AgentRuntime:
         self._tracker = tracker or VerificationTracker()
 
     async def run(self, session: AgentSession) -> AgentSession:
+        """Run the loop; normal, cancellation, and Exception exits leave it terminal.
+
+        Cancellation and unexpected exceptions are recorded best-effort
+        (``INTERRUPTED`` / ``FAILED``) and then re-raised unchanged. ``SystemExit``
+        and ``GeneratorExit`` pass through without the terminal-state guarantee.
+        """
+        try:
+            return await self._run(session)
+        except asyncio.CancelledError:
+            self._record_abnormal_exit(session, SessionState.INTERRUPTED, "cancelled")
+            raise
+        except KeyboardInterrupt:
+            self._record_abnormal_exit(session, SessionState.INTERRUPTED, "interrupted")
+            raise
+        except Exception as exc:
+            self._record_abnormal_exit(
+                session, SessionState.FAILED, f"unexpected error: {type(exc).__name__}"
+            )
+            raise
+
+    async def _run(self, session: AgentSession) -> AgentSession:
         tracker = self._tracker
         limits = session.limits
         session.state = SessionState.RUNNING
@@ -242,6 +271,19 @@ class AgentRuntime:
         turn.ended_at = dt.datetime.now()
         session.history.append(turn)
         return self._terminate(session, state, reason, turn_id=turn_id)
+
+    def _record_abnormal_exit(
+        self, session: AgentSession, state: SessionState, reason: str
+    ) -> None:
+        """Best-effort terminal transition for a run that is about to raise."""
+        if session.state in TERMINAL_STATES:
+            return
+        try:
+            self._terminate(session, state, reason)
+        except Exception:
+            # State is written before the terminal event; a sink failure here
+            # must not replace the exception that is already propagating.
+            pass
 
     def _terminate(
         self,

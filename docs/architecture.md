@@ -577,13 +577,37 @@ future **async approval seam** (an awaitable `Approver`), which is out of scope
 executor signature changes, and a state-transition validator.
 
 **Runtime guarantees.** The runtime is the sole writer of `session.state`; it
-assigns only the states in the diagram above; `session.state` has no control-flow
-reader (the loop is driven by limits, the write tracker, and provider responses);
+assigns only the states in the diagram above; `session.state` does not drive the
+loop (the loop is driven by limits, the write tracker, and provider responses);
 and every return from `AgentRuntime.run()` passes through the terminal
-transition, so the final state is always one of the four terminal states. Invalid
+transition, so a returned session is always in one of the four terminal states.
+The sole runtime read of `session.state` is the abnormal-exit guard described
+below, which only prevents overwriting a state that is already terminal. Invalid
 transitions are prevented by construction — the runtime never assigns a state
 outside this sequence — rather than by a validator; none exists and none is
 required in v0.2.
+
+**Exceptional exits (D26).** `run()` can also raise. On `asyncio.CancelledError`
+it records `INTERRUPTED` with `completed_status="cancelled"`, attempts to emit
+`SessionInterrupted`, and re-raises the cancellation unchanged. On any other
+`Exception` it records `FAILED` with `completed_status="unexpected error:
+<TypeName>"` (type name only — no message), attempts to emit `SessionFailed`, and
+re-raises unchanged. `KeyboardInterrupt` is treated like cancellation
+(`INTERRUPTED`, `completed_status="interrupted"`, re-raised); `SystemExit` and
+`GeneratorExit` pass through untouched. Provider failures that are already
+normalized into a returned `FAILED` session are unaffected.
+
+Terminal-state recording and terminal-event delivery are distinct on these
+paths. The state, `completed_status`, and timestamp are plain field writes that
+precede event emission and cannot fail for a valid session; event delivery is
+best-effort. If the sink raises an `Exception` during abnormal-exit
+reconciliation, that secondary error is suppressed so it cannot replace the
+original exception; a `BaseException` subclass raised by the sink is not
+suppressed.
+Reconciliation never overwrites an already-terminal state and never emits a
+second terminal event — for example, a sink failure after a normal terminal
+transition leaves the session in that terminal state and propagates the sink
+error.
 
 ---
 

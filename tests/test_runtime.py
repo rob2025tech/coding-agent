@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, cast
 
@@ -26,9 +27,15 @@ from coding_agent.contracts import (
     ToolResultStatus,
 )
 from coding_agent.errors import ProviderExecutionError
-from coding_agent.events import EventSink, EventType, ListEventSink
+from coding_agent.events import AgentEvent, EventSink, EventType, ListEventSink
 from coding_agent.executor import ToolExecutor
-from coding_agent.permissions import Approver, AutoApprover, DenyAllApprover, PermissionPolicy
+from coding_agent.permissions import (
+    Approver,
+    AutoApprover,
+    CliApprover,
+    DenyAllApprover,
+    PermissionPolicy,
+)
 from coding_agent.providers.base import ModelProvider
 from coding_agent.providers.mock import (
     MockModelProvider,
@@ -54,12 +61,16 @@ def _build(
     limits: Limits | None = None,
     approver: Approver | None = None,
     executor: ToolExecutor | None = None,
+    sink: ListEventSink | None = None,
+    context_builder: ContextBuilder | None = None,
 ) -> tuple[AgentRuntime, AgentSession, ListEventSink, VerificationTracker]:
     registry = default_registry()
-    sink = ListEventSink()
+    sink = sink or ListEventSink()
     tracker = VerificationTracker()
     verifier = Verifier(verify, repo_root=workspace.repo_root, timeout_s=verify_timeout)
-    context_builder = ContextBuilder(ModelRef.from_descriptor(provider.describe()))
+    context_builder = context_builder or ContextBuilder(
+        ModelRef.from_descriptor(provider.describe())
+    )
     executor = executor or ToolExecutor(
         registry=registry,
         workspace=workspace,
@@ -815,3 +826,224 @@ async def test_repeated_denied_refusals_trip_max_repeated_failures(workspace: Wo
     results = [r for turn in final.history for r in turn.tool_results]
     assert results
     assert all(r.status is ToolResultStatus.DENIED for r in results)
+
+
+# --- D26: exceptional exits (cancellation / unexpected exceptions) ---------- #
+
+
+class _BlockingProvider(ModelProvider):
+    """Provider whose ``generate`` blocks until the test cancels the run."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    def describe(self) -> ModelDescriptor:
+        return ModelDescriptor(
+            provider_id="blocking",
+            model_id="b1",
+            capabilities=ModelCapabilities(text=True, tool_calling=True),
+            context_window=1000,
+        )
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable: cancelled while awaiting")
+
+
+class _BlockingExecutor:
+    """Executor whose ``execute`` blocks until the test cancels the run."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def execute(
+        self, call: ToolCall, *, session_id: str, turn_id: str | None = None
+    ) -> ToolResult:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable: cancelled while awaiting")
+
+
+class _RaisingContextBuilder:
+    def build(self, session: AgentSession, tools: list[object]) -> ModelRequest:
+        raise RuntimeError("context boom")
+
+
+class _RaisingExecutor:
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def execute(
+        self, call: ToolCall, *, session_id: str, turn_id: str | None = None
+    ) -> ToolResult:
+        raise self._exc
+
+
+class _FailingSink(ListEventSink):
+    """Records every event, then raises for the configured event types."""
+
+    def __init__(self, failures: dict[EventType, type[Exception]]) -> None:
+        super().__init__()
+        self._failures = failures
+
+    def emit(self, event: AgentEvent) -> None:
+        super().emit(event)
+        failure = self._failures.get(event.type)
+        if failure is not None:
+            raise failure()
+
+
+async def test_cancellation_records_interrupted_and_reraises(workspace: Workspace) -> None:
+    provider = _BlockingProvider()
+    runtime, session, sink, _t = _build(workspace, provider)
+    task = asyncio.create_task(runtime.run(session))
+    await provider.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert session.state is SessionState.INTERRUPTED
+    assert session.completed_status == "cancelled"
+    assert sink.types()[-1] is EventType.SESSION_INTERRUPTED
+    assert sink.types().count(EventType.SESSION_INTERRUPTED) == 1
+
+
+async def test_cancellation_during_tool_execution_records_interrupted(
+    workspace: Workspace,
+) -> None:
+    executor = _BlockingExecutor()
+    provider = MockModelProvider([tool_call_response("read_file", {"path": "hello.py"})])
+    runtime, session, sink, _t = _build(
+        workspace, provider, executor=cast(ToolExecutor, executor)
+    )
+    task = asyncio.create_task(runtime.run(session))
+    await executor.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert session.state is SessionState.INTERRUPTED
+    assert session.completed_status == "cancelled"
+    assert sink.types()[-1] is EventType.SESSION_INTERRUPTED
+
+
+async def test_context_build_failure_records_failed_and_reraises(workspace: Workspace) -> None:
+    runtime, session, sink, _t = _build(
+        workspace,
+        MockModelProvider([final_response("done")]),
+        context_builder=cast(ContextBuilder, _RaisingContextBuilder()),
+    )
+    with pytest.raises(RuntimeError, match="context boom"):
+        await runtime.run(session)
+
+    assert session.state is SessionState.FAILED
+    assert session.completed_status == "unexpected error: RuntimeError"
+    assert sink.types() == [EventType.SESSION_STARTED, EventType.SESSION_FAILED]
+
+
+async def test_executor_exception_records_failed_and_reraises(workspace: Workspace) -> None:
+    executor = _RaisingExecutor(RuntimeError("executor boom"))
+    provider = MockModelProvider([tool_call_response("read_file", {"path": "hello.py"})])
+    runtime, session, sink, _t = _build(
+        workspace, provider, executor=cast(ToolExecutor, executor)
+    )
+    with pytest.raises(RuntimeError, match="executor boom"):
+        await runtime.run(session)
+
+    assert session.state is SessionState.FAILED
+    assert session.completed_status == "unexpected error: RuntimeError"
+    assert sink.types()[-1] is EventType.SESSION_FAILED
+
+
+async def test_approver_eof_is_failed_not_interrupted(workspace: Workspace) -> None:
+    def _raise_eof(_prompt: str) -> str:
+        raise EOFError
+
+    approver = CliApprover(
+        input_fn=_raise_eof,
+        output_fn=lambda _msg: None,
+        is_tty_fn=lambda: True,
+    )
+    provider = MockModelProvider(
+        [
+            tool_call_response(
+                "edit_file",
+                {"path": "hello.py", "old_text": "print('Hello')", "new_text": "print('Hi')"},
+            )
+        ]
+    )
+    runtime, session, sink, _t = _build(workspace, provider, approver=approver)
+    with pytest.raises(EOFError):
+        await runtime.run(session)
+
+    assert session.state is SessionState.FAILED
+    assert session.completed_status == "unexpected error: EOFError"
+    assert sink.types()[-1] is EventType.SESSION_FAILED
+
+
+async def test_keyboard_interrupt_records_interrupted_and_reraises(workspace: Workspace) -> None:
+    runtime, session, sink, _t = _build(workspace, _RaisingProvider(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        await runtime.run(session)
+
+    assert session.state is SessionState.INTERRUPTED
+    assert session.completed_status == "interrupted"
+    assert sink.types()[-1] is EventType.SESSION_INTERRUPTED
+
+
+async def test_sink_failure_during_run_records_failed_and_emits_terminal_event(
+    workspace: Workspace,
+) -> None:
+    sink = _FailingSink({EventType.SESSION_STARTED: BrokenPipeError})
+    runtime, session, sink, _t = _build(
+        workspace, MockModelProvider([final_response("done")]), sink=sink
+    )
+    with pytest.raises(BrokenPipeError):
+        await runtime.run(session)
+
+    assert session.state is SessionState.FAILED
+    assert session.completed_status == "unexpected error: BrokenPipeError"
+    assert sink.types() == [EventType.SESSION_STARTED, EventType.SESSION_FAILED]
+    assert sink.of_type(EventType.SESSION_FAILED)[0].payload["state"] == "FAILED"
+
+
+async def test_abnormal_terminal_emit_failure_does_not_mask_original(
+    workspace: Workspace,
+) -> None:
+    class _TerminalSinkError(Exception):
+        pass
+
+    sink = _FailingSink(
+        {
+            EventType.SESSION_STARTED: BrokenPipeError,
+            EventType.SESSION_FAILED: _TerminalSinkError,
+        }
+    )
+    runtime, session, sink, _t = _build(
+        workspace, MockModelProvider([final_response("done")]), sink=sink
+    )
+    with pytest.raises(BrokenPipeError):
+        await runtime.run(session)
+
+    assert session.state is SessionState.FAILED
+    assert sink.types() == [EventType.SESSION_STARTED, EventType.SESSION_FAILED]
+
+
+async def test_terminal_event_failure_does_not_overwrite_completed(workspace: Workspace) -> None:
+    sink = _FailingSink({EventType.SESSION_COMPLETED: BrokenPipeError})
+    runtime, session, sink, _t = _build(
+        workspace, MockModelProvider([final_response("done")]), sink=sink
+    )
+    with pytest.raises(BrokenPipeError):
+        await runtime.run(session)
+
+    assert session.state is SessionState.COMPLETED
+    assert session.completed_status == "completed (no verify command)"
+    assert sink.types() == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_REQUESTED,
+        EventType.MODEL_RESPONDED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert EventType.SESSION_FAILED not in sink.types()
